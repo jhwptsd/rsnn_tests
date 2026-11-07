@@ -192,6 +192,20 @@ class SpikingNeuron(nn.Module, ABC):
             return None
         return self._state.get("v_pre", self._state["v"])
 
+    @property
+    def record_pre_reset(self) -> bool:
+        """When True, ``membrane`` returns the pre-reset voltage of the last step."""
+        return self._keep_pre
+
+    @record_pre_reset.setter
+    def record_pre_reset(self, flag: bool) -> None:
+        self._keep_pre = bool(flag)
+
+    def pseudo_derivative(self, v_pre: Tensor) -> Tensor:
+        """d(spike)/d(v) used as the post-synaptic factor of local learning
+        rules (e-prop / three-factor). ``v_pre`` is the pre-reset membrane."""
+        raise NotImplementedError(f"{type(self).__name__} has no pseudo-derivative")
+
     def forward(self, current: Tensor) -> Tensor:
         st = self._state
         if st is not None:
@@ -260,6 +274,10 @@ class ThresholdNeuron(SpikingNeuron):
 
     def _fire(self, v: Tensor, st: State) -> Tensor:
         return spike_fn(v - self.v_threshold, self.surrogate_slope)
+
+    def pseudo_derivative(self, v_pre: Tensor) -> Tensor:
+        d = self.surrogate_slope * (v_pre - self.v_threshold).abs() + 1.0
+        return 1.0 / (d * d)
 
     # ---- core ------------------------------------------------------------ #
     def _init_state(self, like: Tensor) -> State:
@@ -405,6 +423,16 @@ class StochasticLIF(LIF):
             return bern + p - p.detach()  # value = bern, gradient = dp
         return bern
 
+    def pseudo_derivative(self, v_pre: Tensor) -> Tensor:
+        """dp/dv of the escape function (the true derivative of the spike
+        probability, which is what the straight-through gradient uses)."""
+        x = (v_pre - self.v_threshold) / self.delta
+        if self.escape == "sigmoid":
+            p = torch.sigmoid(x)
+            return p * (1.0 - p) / self.delta
+        rate_dt = self.rho0 * torch.exp(x.clamp(max=30.0)) * (self.dt * 1e-3)
+        return torch.exp(-rate_dt) * rate_dt / self.delta
+
 
 # --------------------------------------------------------------------------- #
 # Izhikevich
@@ -474,6 +502,10 @@ class Izhikevich(SpikingNeuron):
         v = torch.zeros_like(like).add_(self.c)
         u = v * self.b
         return {"v": v, "u": u}
+
+    def pseudo_derivative(self, v_pre: Tensor) -> Tensor:
+        d = self.surrogate_slope * (v_pre - self.v_peak).abs() + 1.0
+        return 1.0 / (d * d)
 
     def _step(self, current: Tensor, st: State) -> Tuple[Tensor, State]:
         inplace = not torch.is_grad_enabled()
