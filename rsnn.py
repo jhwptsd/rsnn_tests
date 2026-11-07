@@ -780,27 +780,26 @@ class ThreeFactor(Learner):
                   modulator: Optional[Union[float, Tensor]] = None) -> Dict[str, Tensor]:
         """Loss-gradient estimates (effective-weight units, (post, pre))."""
         m = self.model
-        if rec.v is None:
-            raise ValueError("ThreeFactor needs a recording made with record_membrane=True")
         if modulator is None and error is None:
             raise ValueError("pass an output `error` (dL/dy) or an explicit `modulator`")
         T, B, N = rec.spikes.shape
-        psi = m.pseudo_derivative(rec.v.detach())
-
-        if modulator is not None:
-            L = self._as_modulator(modulator, rec)
-            kappa = self.kappa if self.kappa is not None else 0.0
-        else:
-            L = torch.matmul(error, self._feedback().t())          # (T, B, N)
-            kappa = self.kappa if self.kappa is not None else m.kappa
-        alpha = self.alpha if self.alpha is not None else _membrane_decay(m)
-
-        g = _anticausal_filter(L, kappa) * psi                      # (T, B, N)
         out: Dict[str, Tensor] = {}
-        if "rec" in self.targets:
-            out["rec"] = _flat(g).t() @ _flat(_causal_filter(rec.s_prev, alpha)) / B
-        if "in" in self.targets:
-            out["in"] = _flat(g).t() @ _flat(_causal_filter(rec.x, alpha)) / B
+        if self.targets:      # skipped entirely for readout-only training
+            if rec.v is None:
+                raise ValueError("ThreeFactor needs a recording made with record_membrane=True")
+            psi = m.pseudo_derivative(rec.v.detach())
+            if modulator is not None:
+                L = self._as_modulator(modulator, rec)
+                kappa = self.kappa if self.kappa is not None else 0.0
+            else:
+                L = torch.matmul(error, self._feedback().t())      # (T, B, N)
+                kappa = self.kappa if self.kappa is not None else m.kappa
+            alpha = self.alpha if self.alpha is not None else _membrane_decay(m)
+            g = _anticausal_filter(L, kappa) * psi                  # (T, B, N)
+            if "rec" in self.targets:
+                out["rec"] = _flat(g).t() @ _flat(_causal_filter(rec.s_prev, alpha)) / B
+            if "in" in self.targets:
+                out["in"] = _flat(g).t() @ _flat(_causal_filter(rec.x, alpha)) / B
         if error is not None and self.train_readout:
             z_out = _causal_filter(rec.spikes, m.kappa)
             out["out"] = _flat(error).t() @ _flat(z_out) / B
