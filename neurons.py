@@ -125,10 +125,14 @@ def _mul(x: Tensor, c: Param) -> Tensor:
 
 
 def _axpy_(dst: Tensor, src: Tensor, coef: Param) -> Tensor:
-    """dst += coef * src, in place, for float or per-neuron-tensor coef."""
-    if isinstance(coef, Tensor):
-        return dst.addcmul_(coef, src)
-    return dst.add_(src, alpha=coef)
+    """dst += coef * src, in place, for float or per-neuron-tensor coef.
+
+    Deliberately a separate multiply then add (no ``alpha=`` / ``addcmul_``):
+    those can use fused multiply-add, which rounds differently from the
+    out-of-place ``dst + coef * src``. Threshold dynamics amplify that ~1 ulp
+    difference into different spike times, so both paths must match bitwise.
+    """
+    return dst.add_(src if _is_one(coef) else src * coef)
 
 
 def _fill(v: Tensor, mask: Tensor, value: Param, inplace: bool) -> Tensor:
@@ -479,9 +483,10 @@ class Izhikevich(SpikingNeuron):
         if inplace:
             for _ in range(self.substeps):
                 dv = torch.mul(v, 0.04).add_(5.0).mul_(v).add_(140.0).sub_(u).add_(current)
-                v.add_(dv, alpha=h).clamp_(max=self.V_CLIP)
+                # same op order as the out-of-place path: v + (h * dv)
+                v.add_(dv.mul_(h)).clamp_(max=self.V_CLIP)
             du = torch.mul(v, self.b).sub_(u)
-            _axpy_(u, du, self.a * self.dt)
+            u.add_(du.mul_(self.a * self.dt))  # u + (a*dt) * du, unfused
         else:
             for _ in range(self.substeps):
                 v = (v + h * (v * (0.04 * v + 5.0) + 140.0 - u + current)).clamp(max=self.V_CLIP)
@@ -580,11 +585,23 @@ def _selftest() -> None:
             fast = neuron.sequence(x)
         assert fast.shape == x.shape and set(fast.unique().tolist()) <= {0.0, 1.0}, kind
 
-        # 2. in-place (no_grad) and out-of-place (autograd) paths agree
-        neuron.reset_state()
-        torch.manual_seed(1)
-        slow = neuron.sequence(x)
-        assert torch.equal(fast, slow), f"{kind}: inplace/out-of-place mismatch"
+        # 2. in-place (no_grad) and out-of-place (autograd) paths agree exactly.
+        #    Several seeds: a ~1 ulp rounding difference only flips a spike in
+        #    some runs, so a single seed can hide a mismatch.
+        for seed in range(8):
+            torch.manual_seed(100 + seed)
+            xs = drive(kind)
+            with torch.no_grad():
+                neuron.reset_state()
+                torch.manual_seed(1)
+                a_ = neuron.sequence(xs)
+            neuron.reset_state()
+            torch.manual_seed(1)
+            b_ = neuron.sequence(xs)
+            assert torch.equal(a_, b_), (
+                f"{kind}: inplace/out-of-place mismatch (seed {seed}, "
+                f"{int((a_ != b_).sum())} differing entries)"
+            )
 
         # 3. gradients flow back to the input
         neuron.reset_state()
