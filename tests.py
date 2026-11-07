@@ -12,8 +12,8 @@ Task (applied, time-series, noise-rejecting)
 --------------------------------------------
 Event detection in a noisy always-on input stream. 20 input channels emit
 Poisson background spikes. In 2 of 3 trials a short burst of elevated rate
-appears in channel group A (class 0) or group B (class 1) at a random time in
-the first half of the trial; in the third (class 2) there is only noise. The
+appears in channel group A (class 0) or group B (class 1) at a random time
+(steps 5-22 of 60); in the third (class 2) there is only noise. The
 network must report the class *after a delay*, so it has to ignore noise,
 respond to the specific perturbation, and remember it. The objective is
 cross-entropy of the readout averaged over the final window; the metric is
@@ -65,7 +65,13 @@ from rsnn import RSNN, RSTDP, STDP, SurrogateBPTT, ThreeFactor
 # Task
 # --------------------------------------------------------------------------- #
 N_IN, T_STEPS, WINDOW, N_CLASSES = 20, 60, 10, 3
-P_BG, P_SIG, BURST_LEN = 0.10, 0.22, 8
+# Calibrated with a NumPy replica of this network: an ideal observer reaches
+# 100%, a frozen random reservoir with a trained readout ~60%, which leaves
+# room for methods that also learn the recurrent weights. Weaker bursts
+# (e.g. 0.10 / 0.22 / 8 steps) leave NO usable information in a frozen
+# reservoir, so every method that cannot build memory sits at chance.
+P_BG, P_SIG, BURST_LEN = 0.05, 0.40, 10
+ONSET_LO, ONSET_HI = 5, 22
 TARGET_HZ = 15.0
 TASK_DESC = "3-class burst detection in noise, readout after a delay"
 
@@ -73,7 +79,7 @@ TASK_DESC = "3-class burst detection in noise, readout after a delay"
 def make_batch(batch: int, gen: torch.Generator):
     """x: (T, B, N_IN) spikes; labels: (B,) in {0: burst A, 1: burst B, 2: noise only}."""
     labels = torch.randint(0, N_CLASSES, (batch,), generator=gen)
-    onset = torch.randint(5, T_STEPS // 2 - BURST_LEN + 1, (batch,), generator=gen)
+    onset = torch.randint(ONSET_LO, ONSET_HI + 1, (batch,), generator=gen)
     t = torch.arange(T_STEPS).view(T_STEPS, 1, 1)
     active = ((t >= onset.view(1, batch, 1)) & (t < (onset + BURST_LEN).view(1, batch, 1))).float()
     half = N_IN // 2
@@ -100,6 +106,28 @@ def window_error(y: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     err = torch.zeros_like(y)
     err[-WINDOW:] = p.unsqueeze(0) / WINDOW
     return err
+
+
+def oracle_accuracy(n_train: int = 2000, n_test: int = 256) -> float:
+    """Ceiling: an ideal observer that reads the raw input spikes. Scan statistic =
+    the largest sliding-window (BURST_LEN) spike count in each channel group;
+    'noise only' if both are below a threshold fitted on training trials."""
+    half = N_IN // 2
+
+    def stats(x):
+        c = torch.cat([torch.zeros(1, *x.shape[1:]), x.cumsum(0)])
+        w = c[BURST_LEN:] - c[:-BURST_LEN]                          # (T-L+1, B, N_IN)
+        return torch.stack([w[:, :, :half].sum(2).amax(0), w[:, :, half:].sum(2).amax(0)], dim=1)
+
+    def predict(s, thr):
+        top = s.argmax(dim=1)
+        return torch.where(s.amax(dim=1) < thr, torch.full_like(top, N_CLASSES - 1), top)
+
+    x, y = make_batch(n_train, torch.Generator().manual_seed(3))
+    xt, yt = make_batch(n_test, torch.Generator().manual_seed(999))     # same set as the test split
+    s, st = stats(x), stats(xt)
+    thr = max(range(int(s.max()) + 2), key=lambda t: float((predict(s, t) == y).float().mean()))
+    return float((predict(st, thr) == yt).float().mean())
 
 
 # --------------------------------------------------------------------------- #
@@ -141,11 +169,14 @@ QUICK = Budget(True, ref_n=40, iters=8, batch=16, n_eval=64, seeds=1,
                tune_trials=2, tune_iters=8, tune_seeds=1, neuron_tune_trials=1, rate_weight=50.0)
 
 # log-uniform search ranges (the first trial is always the geometric centre)
+# Readout step sizes must be large: the delta-rule gradient is small (the error is
+# divided by WINDOW and the filtered spike features are ~0.3), so at lr_out <= 0.1
+# the readout barely leaves its initialisation in ~100 iterations.
 SPACES: Dict[str, Dict[str, tuple]] = {
-    "reservoir": {"lr_out": (1e-4, 1e-1)},
-    "stdp": {"lr": (1e-3, 10.0), "lr_out": (1e-4, 1e-1)},
-    "rstdp": {"lr": (1e-3, 10.0), "lr_out": (1e-4, 1e-1)},
-    "eprop": {"lr": (1e-5, 1e-1), "lr_out": (1e-4, 1e-1)},
+    "reservoir": {"lr_out": (1e-2, 1e2)},
+    "stdp": {"lr": (1e-3, 10.0), "lr_out": (1e-2, 1e2)},
+    "rstdp": {"lr": (1e-3, 10.0), "lr_out": (1e-2, 1e2)},
+    "eprop": {"lr": (1e-4, 1.0), "lr_out": (1e-2, 1e2)},
     "bptt": {"lr": (1e-4, 3e-2)},
 }
 
@@ -175,6 +206,12 @@ NEURON_NAME = {"if": "IF", "lif": "LIF", "alif": "Adaptive LIF",
                "stochastic_lif": "Stochastic LIF", "izhikevich": "Izhikevich"}
 
 FAILURES: List[str] = []
+
+# Fingerprint of everything that changes what a result means. Cached results and
+# tuned hyper-parameters from a different task/search space are discarded.
+TASK_SIG = json.loads(json.dumps(dict(
+    n_in=N_IN, T=T_STEPS, window=WINDOW, p_bg=P_BG, p_sig=P_SIG, burst_len=BURST_LEN,
+    onset=[ONSET_LO, ONSET_HI], target_hz=TARGET_HZ, spaces=SPACES)))
 
 
 # --------------------------------------------------------------------------- #
@@ -305,11 +342,15 @@ class HPStore:
         if os.path.exists(path) and not retune:
             with open(path) as f:
                 self.data = json.load(f)
+            if self.data.get("_task") != TASK_SIG:
+                print(f"{path}: tuned for a different task / search space, discarding", flush=True)
+                self.data = {}
 
     def get(self, method: str, neuron: str, bud: Budget) -> dict:
         key = f"{method}|{neuron}"
         if key not in self.data:
             self.data[key] = self._tune(method, neuron, bud)
+            self.data["_task"] = TASK_SIG
             with open(self.path, "w") as f:
                 json.dump(self.data, f, indent=2)
         return self.data[key]["hp"]
@@ -432,6 +473,17 @@ def _fmt(v):
     return str(v) if isinstance(v, int) else f"{v:g}"
 
 
+def _refs(ax, meta, x_left):
+    """Reference lines: chance, and the ideal-observer ceiling when known."""
+    ax.axhline(CHANCE, color=MUTED, linewidth=1.0, zorder=1)
+    ax.text(x_left, CHANCE + 0.015, "chance", fontsize=7.5, color=MUTED, ha="left", va="bottom")
+    ceiling = meta.get("oracle")
+    if ceiling:
+        ax.axhline(ceiling, color=MUTED, linewidth=1.0, zorder=1)
+        ax.text(x_left, ceiling - 0.015, "ideal observer (reads the raw input)", fontsize=7.5,
+                color=MUTED, ha="left", va="top")
+
+
 def _subtitle(meta) -> str:
     return (f"{TASK_DESC}.  Mean ± s.d. over {meta['seeds']} seeds, test set n={meta['n_eval']}.  "
             f"Chance = {CHANCE:.0%}.")
@@ -456,8 +508,7 @@ def plot_lines(path, spec, agg, values, meta):
     ax.minorticks_off()
     ax.set_xlabel(spec["xlabel"], fontsize=8.5, color=SECONDARY, labelpad=6)
 
-    ax.axhline(CHANCE, color=MUTED, linewidth=1.0, zorder=1)
-    ax.text(xs.min(), CHANCE + 0.015, "chance", fontsize=7.5, color=MUTED, ha="left", va="bottom")
+    _refs(ax, meta, xs.min())
 
     ends = []
     for m in MAIN:
@@ -548,8 +599,7 @@ def plot_bars(path, spec, agg, values, meta):
                        [by_x.get(v, {}).get("std", np.nan) for v in values]))
     ax = _bar_panel(fig, [0.11, 0.27, 0.86, 0.56], values, [NEURON_NAME.get(v, v) for v in values],
                     series, (0.0, 1.0), "Test accuracy", True, False, spec["xlabel"])
-    ax.axhline(CHANCE, color=MUTED, linewidth=1.0, zorder=1)
-    ax.text(ax.get_xlim()[0] + 0.02, CHANCE + 0.015, "chance", fontsize=7.5, color=MUTED, ha="left", va="bottom")
+    _refs(ax, meta, ax.get_xlim()[0] + 0.02)
     handles = [Patch(facecolor=COLOR[m], edgecolor="none", label=METHOD_NAME[m]) for m in MAIN]
     fig.legend(handles=handles, loc="lower center", ncol=3, frameon=False, fontsize=8,
                labelcolor=SECONDARY, bbox_to_anchor=(0.5, 0.01), handlelength=1.2, columnspacing=1.6)
@@ -569,8 +619,7 @@ def plot_method(path, spec, agg, values, meta):
     sec = [agg.get(v, {}).get(v, {}).get("seconds", np.nan) for v in values]
     ax = _bar_panel(fig, [0.08, 0.17, 0.41, 0.63], values, names, [("Test accuracy", SINGLE, acc, std)],
                     (0.0, 1.0), "Test accuracy", True, True, spec["xlabel"])
-    ax.axhline(CHANCE, color=MUTED, linewidth=1.0, zorder=1)
-    ax.text(ax.get_xlim()[0] + 0.02, CHANCE + 0.015, "chance", fontsize=7.5, color=MUTED, ha="left", va="bottom")
+    _refs(ax, meta, ax.get_xlim()[0] + 0.02)
     top = max([s for s in sec if not np.isnan(s)] or [1.0]) * 1.25
     _bar_panel(fig, [0.58, 0.17, 0.40, 0.63], values, names, [("Training time", SINGLE, sec, [0] * len(sec))],
                (0.0, top), "Training time (s)", False, True, spec["xlabel"])
@@ -589,6 +638,22 @@ def make_outputs(out: str, name: str, records: List[dict], meta: dict) -> None:
     write_csv(os.path.join(out, spec["file"].replace(".png", ".csv")), name, agg)
     PLOTTERS[spec["kind"]](os.path.join(out, spec["file"]), spec, agg, values, meta)
     print(f"wrote {spec['file']} (+ csv)", flush=True)
+
+
+def preflight(bud: Budget, ceiling: float) -> None:
+    """Cheap sanity check before the long run: can a *frozen* reservoir with a
+    trained readout beat chance on this task? If not, every method that cannot
+    build memory sits at chance and the comparison says nothing."""
+    r = safe_run(Cfg(n_rec=bud.ref_n, method="reservoir"), {"lr_out": 1.0}, bud, seed=0, split="val")
+    print(f"preflight: chance {CHANCE:.0%} | frozen reservoir {r['acc']:.0%} "
+          f"at {r['rate_hz']:.1f} Hz | ideal observer {ceiling:.0%}", flush=True)
+    if not r["acc"] > CHANCE + 0.08:
+        print("WARNING: the frozen reservoir is at chance, so the input does not survive in "
+              "its activity. Methods that cannot learn memory will show chance accuracy. "
+              "Make the burst stronger (P_SIG), longer (BURST_LEN) or later (ONSET_*), or "
+              "give the neurons slower dynamics.", file=sys.stderr, flush=True)
+    if bud.quick:
+        print("(quick budget: too few iterations for this number to be meaningful)")
 
 
 # --------------------------------------------------------------------------- #
@@ -611,15 +676,22 @@ def main(argv=None) -> int:
     out = args.out or ("results_quick" if args.quick else "results")
     os.makedirs(out, exist_ok=True)
     res_path = os.path.join(out, "results.json")
-    results = {"meta": asdict(bud), "sweeps": {}}
+    results = {"meta": {}, "sweeps": {}}
     if os.path.exists(res_path):
         with open(res_path) as f:
             results = json.load(f)
+        if results.get("meta", {}).get("task") != TASK_SIG:
+            if args.plots_only:
+                print("warning: results.json was produced with a different task definition", file=sys.stderr)
+            else:
+                print(f"{res_path}: produced with a different task definition, discarding", flush=True)
+                results = {"meta": {}, "sweeps": {}}
     names = args.only or list(SWEEPS)
 
     if not args.plots_only:
+        results["meta"] = dict(asdict(bud), task=TASK_SIG, oracle=oracle_accuracy(n_test=bud.n_eval))
+        preflight(bud, results["meta"]["oracle"])
         store = HPStore(os.path.join(out, "hparams.json"), retune=args.retune)
-        results["meta"] = asdict(bud)
         for name in names:
             if name in results["sweeps"] and not args.force:
                 print(f"[{name}] already in results.json, skipping (use --force to redo)")
