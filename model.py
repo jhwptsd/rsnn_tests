@@ -83,7 +83,18 @@ class SpikingLM(nn.Module):
     # ------------------------------------------------------------------ #
     @property
     def num_parameters(self) -> int:
+        """Stored parameters: every element of every parameter tensor, including the
+        masked-out entries of the sparse matrices (which never change)."""
         return sum(p.numel() for p in self.parameters())
+
+    @property
+    def num_effective_parameters(self) -> int:
+        """Trainable parameters: only the weights the sparsity masks leave connected.
+        The masked entries are multiplied by zero in the forward pass, receive zero
+        gradient and are never updated, so they are not degrees of freedom."""
+        r = self.rsnn
+        return (self.embed.weight.numel() + r.b_out.numel()
+                + int(r.in_mask.sum()) + int(r.rec_mask.sum()) + r.n_out * int(r.out_mask.sum()))
 
     def reset_state(self) -> None:
         """Forget the network state (start of a new document / stream)."""
