@@ -758,9 +758,11 @@ class ThreeFactor(Learner):
             return (m.w_out * m.out_mask).detach().t()
         if self.feedback == "random":
             if self._B is None:
-                g = torch.Generator().manual_seed(self._seed)
+                g = torch.Generator().manual_seed(self._seed)       # same matrix on any device
                 self._B = torch.randn(m.n_rec, m.n_out, generator=g) / math.sqrt(m.n_out)
-            return self._B.to(m.w_out.device, m.w_out.dtype)
+            if self._B.device != m.w_out.device or self._B.dtype != m.w_out.dtype:
+                self._B = self._B.to(m.w_out.device, m.w_out.dtype)  # move once, then reuse
+            return self._B
         raise ValueError("feedback must be 'random', 'symmetric' or a (N, n_out) tensor")
 
     @staticmethod

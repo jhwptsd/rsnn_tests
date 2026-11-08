@@ -61,6 +61,12 @@ import torch.nn.functional as F
 
 from rsnn import RSNN, RSTDP, STDP, SurrogateBPTT, ThreeFactor
 
+# Runs on the GPU when one is available. Override with --device, or by
+# reassigning DEVICE (e.g. torch.device("cpu")) before calling run()/run_sweep().
+# Data are generated on the CPU with seeded generators (so a seed means the same
+# trials on any device) and moved over; everything else lives on DEVICE.
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 # --------------------------------------------------------------------------- #
 # Task
 # --------------------------------------------------------------------------- #
@@ -76,8 +82,9 @@ TARGET_HZ = 15.0
 TASK_DESC = "3-class burst detection in noise, readout after a delay"
 
 
-def make_batch(batch: int, gen: torch.Generator):
-    """x: (T, B, N_IN) spikes; labels: (B,) in {0: burst A, 1: burst B, 2: noise only}."""
+def make_batch(batch: int, gen: torch.Generator, device: Optional[torch.device] = None):
+    """x: (T, B, N_IN) spikes; labels: (B,) in {0: burst A, 1: burst B, 2: noise only}.
+    Generated on the CPU from ``gen`` and moved to ``device`` if given."""
     labels = torch.randint(0, N_CLASSES, (batch,), generator=gen)
     onset = torch.randint(ONSET_LO, ONSET_HI + 1, (batch,), generator=gen)
     t = torch.arange(T_STEPS).view(T_STEPS, 1, 1)
@@ -88,6 +95,8 @@ def make_batch(batch: int, gen: torch.Generator):
     group[labels == 1, half:] = 1.0
     p = P_BG + (P_SIG - P_BG) * active * group.unsqueeze(0)
     x = (torch.rand(T_STEPS, batch, N_IN, generator=gen) < p).float()
+    if device is not None:
+        x, labels = x.to(device), labels.to(device)
     return x, labels
 
 
@@ -218,9 +227,10 @@ TASK_SIG = json.loads(json.dumps(dict(
 # One training run
 # --------------------------------------------------------------------------- #
 def build_net(cfg: Cfg, gain: float, seed: int) -> RSNN:
-    return RSNN(N_IN, cfg.n_rec, N_CLASSES, exc_fraction=cfg.exc_fraction,
-                connectivity=cfg.connectivity, neuron=cfg.neuron,
-                input_scale=gain, rec_scale=gain, seed=seed)
+    net = RSNN(N_IN, cfg.n_rec, N_CLASSES, exc_fraction=cfg.exc_fraction,
+               connectivity=cfg.connectivity, neuron=cfg.neuron,
+               input_scale=gain, rec_scale=gain, seed=seed)
+    return net.to(DEVICE)       # before any optimiser is created
 
 
 _GAIN_CACHE: Dict[tuple, float] = {}
@@ -234,7 +244,7 @@ def calibrate_gain(cfg: Cfg, seed: int, iters: int = 10) -> float:
     if key in _GAIN_CACHE:
         return _GAIN_CACHE[key]
     gen = torch.Generator().manual_seed(10_000 + seed)
-    x, _ = make_batch(32, gen)
+    x, _ = make_batch(32, gen, DEVICE)
     lo, hi = math.log(1e-2), math.log(1e3)
     best_err, best_gain = float("inf"), math.exp((lo + hi) / 2)
     for _ in range(iters):
@@ -254,6 +264,12 @@ def calibrate_gain(cfg: Cfg, seed: int, iters: int = 10) -> float:
     return best_gain
 
 
+def _sync() -> None:
+    """CUDA kernels are asynchronous; wait so wall-clock timings are honest."""
+    if DEVICE.type == "cuda":
+        torch.cuda.synchronize()
+
+
 def run(cfg: Cfg, hp: dict, bud: Budget, seed: int, split: str = "test",
         iters: Optional[int] = None) -> dict:
     """Train ``cfg.method`` and return accuracy on a fixed held-out set."""
@@ -262,7 +278,8 @@ def run(cfg: Cfg, hp: dict, bud: Budget, seed: int, split: str = "test",
     net = build_net(cfg, gain, seed)
     net.w_max = 3.0 * float(net.rec_magnitude().max())      # cap for the STDP family
     gen = torch.Generator().manual_seed(seed * 7919 + 1)
-    x_eval, y_eval = make_batch(bud.n_eval, torch.Generator().manual_seed(555 if split == "val" else 999))
+    x_eval, y_eval = make_batch(bud.n_eval, torch.Generator().manual_seed(555 if split == "val" else 999),
+                                DEVICE)
     iters = iters or bud.iters
     m = cfg.method
 
@@ -279,9 +296,10 @@ def run(cfg: Cfg, hp: dict, bud: Budget, seed: int, split: str = "test",
         elif m == "rstdp":
             rstdp = RSTDP(net, tau_elig=100.0, lr=hp["lr"], w_max=net.w_max, mu=0.5)
 
+    _sync()
     t0 = time.time()
     for _ in range(iters):
-        x, labels = make_batch(bud.batch, gen)
+        x, labels = make_batch(bud.batch, gen, DEVICE)
         if bptt is not None:
             bptt.update(x, labels.unsqueeze(0).expand(T_STEPS, -1))
             continue
@@ -301,6 +319,7 @@ def run(cfg: Cfg, hp: dict, bud: Budget, seed: int, split: str = "test",
             elif rstdp is not None:
                 correct = (window_logits(y).argmax(dim=1) == labels).float()
                 rstdp.update(rec, reward=2.0 * correct - 1.0)
+    _sync()
     seconds = time.time() - t0
 
     net.reset_state()
@@ -414,13 +433,21 @@ def aggregate(records: List[dict]) -> Dict[str, Dict[object, dict]]:
     return out
 
 
+TABLE_COLUMNS = ("sweep", "x", "method", "acc_mean", "acc_std", "n_seeds", "train_seconds", "rate_hz")
+
+
+def table_rows(sweep: str, agg: Dict[str, Dict[object, dict]]) -> List[dict]:
+    """The table view of a figure (also what ends up in the CSV)."""
+    return [dict(sweep=sweep, x=x, method=m, acc_mean=round(a["acc"], 4), acc_std=round(a["std"], 4),
+                 n_seeds=a["n"], train_seconds=round(a["seconds"], 2), rate_hz=round(a["rate_hz"], 2))
+            for m, by_x in agg.items() for x, a in by_x.items()]
+
+
 def write_csv(path: str, sweep: str, agg: Dict[str, Dict[object, dict]]) -> None:
     with open(path, "w") as f:
-        f.write("sweep,x,method,acc_mean,acc_std,n_seeds,train_seconds,rate_hz\n")
-        for m, by_x in agg.items():
-            for x, a in by_x.items():
-                f.write(f"{sweep},{x},{m},{a['acc']:.4f},{a['std']:.4f},{a['n']},"
-                        f"{a['seconds']:.2f},{a['rate_hz']:.2f}\n")
+        f.write(",".join(TABLE_COLUMNS) + "\n")
+        for row in table_rows(sweep, agg):
+            f.write(",".join(str(row[c]) for c in TABLE_COLUMNS) + "\n")
 
 
 # --------------------------------------------------------------------------- #
@@ -438,13 +465,24 @@ MARKER = {"reservoir": "o", "eprop": "s", "bptt": "^"}
 SINGLE = "#2a78d6"        # one-series bar charts use categorical slot 1
 CHANCE = 1.0 / N_CLASSES
 DPI = 200
+SHOW = False              # True in a notebook: draw figures inline instead of only saving
 
 
 def _mpl():
     import matplotlib
-    matplotlib.use("Agg")
+    if not SHOW:
+        matplotlib.use("Agg")      # headless; in a notebook keep the inline backend
     import matplotlib.pyplot as plt
     return plt
+
+
+def _finish(fig, plt, path):
+    """Save to ``path`` (if given) and/or display inline (if SHOW)."""
+    if path:
+        fig.savefig(path, dpi=DPI, facecolor=SURFACE)
+    if SHOW:
+        plt.show()
+    plt.close(fig)
 
 
 def _new_axes(fig, rect, ylim, ylabel, pct=True):
@@ -534,12 +572,12 @@ def plot_lines(path, spec, agg, values, meta):
     fig.legend(handles=handles, loc="lower center", ncol=3, frameon=False, fontsize=8,
                labelcolor=SECONDARY, bbox_to_anchor=(0.5, 0.01), handlelength=2.2, columnspacing=1.6)
     _titles(fig, spec["title"], _subtitle(meta))
-    fig.savefig(path, dpi=DPI, facecolor=SURFACE)
-    plt.close(fig)
+    _finish(fig, plt, path)
 
 
-def _round_bar(ax, x, h, w, color, r_px=8.0):
-    """Bar with a rounded data-end (4 css px at 2x) and a square baseline."""
+def _round_bar(ax, x, h, w, color, r_px=None):
+    """Bar with a rounded data-end (4 css px) and a square baseline."""
+    r_px = 4.0 * DPI / 100.0 if r_px is None else r_px
     from matplotlib.patches import FancyBboxPatch, Rectangle
     if not (h > 0):
         return
@@ -566,7 +604,7 @@ def _bar_panel(fig, rect, cats, cat_labels, series, ylim, ylabel, pct, label_tip
     ax.set_xlabel(xlabel, fontsize=8.5, color=SECONDARY, labelpad=6)
     slot = min(0.24, 0.72 / k)
     bb = ax.get_window_extent()
-    gap = 4.0 * (ax.get_xlim()[1] - ax.get_xlim()[0]) / bb.width            # 2 css px at 2x
+    gap = (2.0 * DPI / 100.0) * (ax.get_xlim()[1] - ax.get_xlim()[0]) / bb.width   # 2 css px
     span = ylim[1] - ylim[0]
     for j, (name, color, means, stds) in enumerate(series):
         for i in range(n):
@@ -604,8 +642,7 @@ def plot_bars(path, spec, agg, values, meta):
     fig.legend(handles=handles, loc="lower center", ncol=3, frameon=False, fontsize=8,
                labelcolor=SECONDARY, bbox_to_anchor=(0.5, 0.01), handlelength=1.2, columnspacing=1.6)
     _titles(fig, spec["title"], _subtitle(meta))
-    fig.savefig(path, dpi=DPI, facecolor=SURFACE)
-    plt.close(fig)
+    _finish(fig, plt, path)
 
 
 def plot_method(path, spec, agg, values, meta):
@@ -624,20 +661,25 @@ def plot_method(path, spec, agg, values, meta):
     _bar_panel(fig, [0.58, 0.17, 0.40, 0.63], values, names, [("Training time", SINGLE, sec, [0] * len(sec))],
                (0.0, top), "Training time (s)", False, True, spec["xlabel"])
     _titles(fig, spec["title"], _subtitle(meta) + "  Right: wall-clock training time.")
-    fig.savefig(path, dpi=DPI, facecolor=SURFACE)
-    plt.close(fig)
+    _finish(fig, plt, path)
 
 
 PLOTTERS = {"lines": plot_lines, "bars": plot_bars, "method": plot_method}
 
 
-def make_outputs(out: str, name: str, records: List[dict], meta: dict) -> None:
+def make_outputs(out: Optional[str], name: str, records: List[dict], meta: dict) -> List[dict]:
+    """Draw (and, if ``out`` is a directory, save) the figure for one sweep.
+    With ``out=None`` nothing touches the disk: set SHOW=True to display it.
+    Returns the table rows behind the figure."""
     spec = SWEEPS[name]
     values = spec["quick"] if meta["quick"] else spec["values"]
     agg = aggregate(records)
-    write_csv(os.path.join(out, spec["file"].replace(".png", ".csv")), name, agg)
-    PLOTTERS[spec["kind"]](os.path.join(out, spec["file"]), spec, agg, values, meta)
-    print(f"wrote {spec['file']} (+ csv)", flush=True)
+    png = os.path.join(out, spec["file"]) if out else None
+    if out:
+        write_csv(os.path.join(out, spec["file"].replace(".png", ".csv")), name, agg)
+        print(f"wrote {spec['file']} (+ csv)", flush=True)
+    PLOTTERS[spec["kind"]](png, spec, agg, values, meta)
+    return table_rows(name, agg)
 
 
 def preflight(bud: Budget, ceiling: float) -> None:
@@ -668,8 +710,13 @@ def main(argv=None) -> int:
     ap.add_argument("--retune", action="store_true", help="redo the hyper-parameter search")
     ap.add_argument("--force", action="store_true", help="re-run sweeps already in results.json")
     ap.add_argument("--plots-only", action="store_true", help="only re-draw from results.json")
+    ap.add_argument("--device", default=None, help="cuda / cpu (default: cuda if available)")
     args = ap.parse_args(argv)
 
+    global DEVICE
+    if args.device:
+        DEVICE = torch.device(args.device)
+    print(f"device: {DEVICE}" + (f" ({torch.cuda.get_device_name(DEVICE)})" if DEVICE.type == "cuda" else ""))
     bud = QUICK if args.quick else FULL
     if args.seeds:
         bud = replace(bud, seeds=args.seeds)
