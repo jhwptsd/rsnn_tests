@@ -65,6 +65,8 @@ LABEL = {"spiking": "Spiking RSNN",
          "transformer_stored": "Transformer (matched stored params)"}
 SHORT = {"spiking": "Spiking\nRSNN", "transformer_eff": "Transformer\n(trainable)",
          "transformer_stored": "Transformer\n(stored)"}
+END_LABEL = {"spiking": "Spiking", "transformer_eff": "Transf. (trainable)",
+             "transformer_stored": "Transf. (stored)"}      # short enough to fit beside a line end
 # Categorical slots 1-3 of the validated palette; colour follows the model in every figure.
 COLOR = {"spiking": "#2a78d6", "transformer_eff": "#eb6834", "transformer_stored": "#1baf7a"}
 MARKER = {"spiking": "o", "transformer_eff": "s", "transformer_stored": "^"}
@@ -241,11 +243,11 @@ def _line_panel(fig, rect, vis, curves, xlabel, ylabel, xlog=False, end_labels=F
         if xlog:
             ax.set_xlim(x_min / 1.1, x_max * 1.15)
         else:                                          # room on the right for the end labels
-            ax.set_xlim(0.0, x_max + 0.25 * (x_max - x_min))
+            ax.set_xlim(0.0, x_max + (0.5 if end_labels else 0.05) * (x_max - x_min))
     ends = sorted((ys[-1], name, xs[-1]) for name, xs, ys, _ in curves if len(ys))
     if end_labels and len(ends) > 1 and min(b[0] - a[0] for a, b in zip(ends, ends[1:])) >= 0.1 * (hi - lo or 1.0):
         for y, name, x in ends:
-            ax.annotate(SHORT[name].replace("\n", " "), (x, y), xytext=(8, 0), textcoords="offset points",
+            ax.annotate(END_LABEL[name], (x, y), xytext=(8, 0), textcoords="offset points",
                         fontsize=7.5, color=vis.PRIMARY, va="center", ha="left")
     ax.set_xlabel(xlabel, fontsize=8.5, color=vis.SECONDARY, labelpad=6)
     return ax
@@ -265,7 +267,7 @@ def plot_loss_curves(history: dict, path: Optional[str]) -> None:
     _line_panel(fig, [0.385, 0.25, 0.27, 0.56], vis,
                 [(m, [e["tokens"] / 1e6 for e in val[m]], [e["bpc"] for e in val[m]], True) for m in models],
                 "Training tokens seen (millions)", "Validation bits / char", end_labels=True)
-    _line_panel(fig, [0.715, 0.25, 0.27, 0.56], vis,
+    _line_panel(fig, [0.75, 0.25, 0.235, 0.56], vis,
                 [(m, [e["time"] for e in trn[m]], [e["bpc"] for e in trn[m]], False) for m in models],
                 "Training time (s, log scale)", "Training bits / char", xlog=True)
     handles = [Line2D([0], [0], color=COLOR[m], linewidth=1.8, marker=MARKER[m], markersize=7,
