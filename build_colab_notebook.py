@@ -4,8 +4,10 @@ from the project's source files, so the notebook never drifts from the code:
 
     python build_colab_notebook.py
 
-* neurons.py and rsnn.py are embedded verbatim with ``%%writefile`` cells, so
-  the notebook needs nothing but a Colab runtime (no repository checkout).
+* neurons.py, rsnn.py and the language-model files (model.py, train_model.py,
+  transformer_model.py, compare_models.py) are embedded verbatim with
+  ``%%writefile`` cells, so the notebook needs nothing but a Colab runtime (no
+  repository checkout).
 * tests.py is split into one cell per section (task, budgets, training run,
   hyper-parameter search, sweeps, plotting); its command-line ``main()`` is
   replaced by notebook cells that run each sweep and display its figure and
@@ -20,6 +22,9 @@ ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "biolearning_benchmarks.ipynb"
 
 BANNER = re.compile(r"^# -{40,} #$")
+# dependency order: each file only imports files listed before it
+LIBRARY_FILES = ["neurons.py", "rsnn.py", "transformer_model.py", "model.py", "train_model.py",
+                 "compare_models.py"]
 
 
 def md(text: str) -> dict:
@@ -55,9 +60,11 @@ INTRO = """
 
 Benchmarks a **recurrent spiking neural network** with excitatory and inhibitory
 neurons on a noisy burst-detection task, sweeping five things: **network size,
-E/I ratio, neuron type, learning method and sparsity**. Learning rates are tuned
-beforehand by random search on a validation set. Every figure is drawn inline
-and followed by the table behind it; nothing is downloaded.
+E/I ratio, neuron type, learning method and sparsity**. A sixth sweep trains the
+spiking **language model** on character-level text and varies **how many spiking
+updates each token gets (1 to 8)**. Learning rates are tuned beforehand by
+random search on a validation set. Every figure is drawn inline and followed by
+the table behind it; nothing is downloaded.
 
 **How to use**
 1. *Runtime > Change runtime type > GPU* (a T4 is enough).
@@ -174,6 +181,11 @@ SWEEP_TEXT = {
                "Accuracy on the left, wall-clock training time on the right."),
     "sparsity": ("Sweep 5: sparsity",
                  "Recurrent connection density from 2% to 100%."),
+    "steps": ("Sweep 6: spiking updates per token (language model)",
+              "Trains the spiking language model on character-level text (Tiny Shakespeare, downloaded "
+              "automatically) with 1 to 8 spiking updates per token and reports test accuracy, bits per "
+              "character and training time. This is the slowest sweep, because cost grows with the number "
+              "of updates; run it on its own with `run_and_show(\"steps\")`."),
 }
 
 SECTION_MD = {
@@ -185,6 +197,9 @@ SECTION_MD = {
         "## Hyper-parameter search\nRandom search for learning rates on a validation set, done before "
         "the sweeps and cached.",
     "Sweeps": "## Sweep machinery",
+    "Language-model sweep: spiking updates per token":
+        "## Language-model sweep machinery\nTrains the spiking language model with k updates per token, "
+        "reusing the training and evaluation code of the model comparison.",
     "Plotting (matplotlib, imported lazily so the experiments run without it)":
         "## Plotting\nLight-mode validated palette, legend + direct labels + table view.",
 }
@@ -204,14 +219,14 @@ if FAILURES:
 
 
 def main() -> None:
-    neurons = (ROOT / "neurons.py").read_text()
-    rsnn = (ROOT / "rsnn.py").read_text()
     doc, header, sections = split_tests((ROOT / "tests.py").read_text())
 
+    library = [(name, (ROOT / name).read_text()) for name in LIBRARY_FILES]
     cells = [md(INTRO), code(GPU_CHECK), code(SETTINGS),
-             md("## Library code\nThe neuron models and the network are written to files so they can be "
-                "imported. They are embedded verbatim from `neurons.py` and `rsnn.py`."),
-             code("%%writefile neurons.py\n" + neurons), code("%%writefile rsnn.py\n" + rsnn),
+             md("## Library code\nThe neuron models, the network, the language model and its training and "
+                "comparison code are written to files so they can be imported. They are embedded verbatim "
+                "from the repository files of the same names."),
+             *[code(f"%%writefile {name}\n" + text) for name, text in library],
              md("### Optional self-tests"), code(SELFTEST),
              md("## Benchmark protocol\n```text\n" + doc + "\n```"),
              code(header)]

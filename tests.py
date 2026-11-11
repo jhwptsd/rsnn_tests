@@ -38,6 +38,16 @@ Protocol
   network is rather than how well it computes.
 * Each sweep point is repeated over several seeds (network + data stream).
 
+Language-model sweep ("steps")
+------------------------------
+The one sweep that is not on the burst-detection task: it trains the spiking
+language model of model.py on character-level text and varies how many spiking
+updates each token gets (steps_per_token = 1..8, readouts averaged). With one
+update the logits come from a single step of binary spikes; more updates give a
+graded, rate-coded readout and more recurrent computation per token, at k times
+the compute. Everything else (data, steps, seeds, learning rate) is held fixed.
+Metrics: test next-character accuracy and bits per character, plus training time.
+
 Outputs (in --out): results.json, hparams.json, one PNG and one CSV per sweep.
 The CSV is the table view of each figure.
 """
@@ -54,12 +64,15 @@ import sys
 import time
 import traceback
 from dataclasses import asdict, dataclass, replace
+from types import SimpleNamespace
 from typing import Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
 
 from rsnn import RSNN, RSTDP, STDP, SurrogateBPTT, ThreeFactor
+from compare_models import evaluate as lm_evaluate, make_spiking, run_training   # language-model sweep
+from train_model import CharTokenizer, batchify, load_text, split_ids
 
 # Runs on the GPU when one is available. Override with --device, or by
 # reassigning DEVICE (e.g. torch.device("cpu")) before calling run()/run_sweep().
@@ -170,12 +183,24 @@ class Budget:
     tune_seeds: int
     neuron_tune_trials: int  # trials per (method, neuron) in the neuron sweep
     rate_weight: float
+    # language-model sweep (spiking updates per token)
+    lm_data: str = "tinyshakespeare"
+    lm_n_rec: int = 256
+    lm_d_emb: int = 64
+    lm_seq: int = 64
+    lm_batch: int = 32
+    lm_steps: int = 400
+    lm_tune_steps: int = 120
+    lm_eval_chunks: int = 40
+    lm_seeds: int = 2
 
 
 FULL = Budget(False, ref_n=100, iters=120, batch=32, n_eval=256, seeds=3,
               tune_trials=8, tune_iters=120, tune_seeds=2, neuron_tune_trials=4, rate_weight=50.0)
 QUICK = Budget(True, ref_n=40, iters=8, batch=16, n_eval=64, seeds=1,
-               tune_trials=2, tune_iters=8, tune_seeds=1, neuron_tune_trials=1, rate_weight=50.0)
+               tune_trials=2, tune_iters=8, tune_seeds=1, neuron_tune_trials=1, rate_weight=50.0,
+               lm_data="builtin", lm_n_rec=64, lm_d_emb=16, lm_seq=16, lm_batch=8, lm_steps=15,
+               lm_tune_steps=8, lm_eval_chunks=3, lm_seeds=1)
 
 # log-uniform search ranges (the first trial is always the geometric centre)
 # Readout step sizes must be large: the delta-rule gradient is small (the error is
@@ -204,6 +229,9 @@ SWEEPS = {
     "sparsity": dict(field="connectivity", values=[0.02, 0.05, 0.1, 0.25, 0.5, 1.0], quick=[0.05, 0.5],
                      kind="lines", xscale="log", xlabel="Recurrent connection density",
                      title="Accuracy vs sparsity", file="fig_sparsity.png"),
+    "steps": dict(field="steps_per_token", values=list(range(1, 9)), quick=[1, 2, 4], kind="steps",
+                  xlabel="Spiking updates per token", title="Language model vs spiking updates per token",
+                  file="fig_steps_per_token.png"),
 }
 
 METHOD_NAME = {"reservoir": "Reservoir (readout only)", "stdp": "STDP + readout",
@@ -374,6 +402,12 @@ class HPStore:
                 json.dump(self.data, f, indent=2)
         return self.data[key]["hp"]
 
+    def put(self, key: str, value: dict) -> None:
+        self.data[key] = value
+        self.data["_task"] = TASK_SIG
+        with open(self.path, "w") as f:
+            json.dump(self.data, f, indent=2)
+
     @staticmethod
     def _tune(method: str, neuron: str, bud: Budget) -> dict:
         cfg = Cfg(n_rec=bud.ref_n, neuron=neuron, method=method)
@@ -396,6 +430,8 @@ class HPStore:
 # Sweeps
 # --------------------------------------------------------------------------- #
 def run_sweep(name: str, bud: Budget, store: HPStore) -> List[dict]:
+    if name == "steps":
+        return run_steps_sweep(bud, store)
     spec = SWEEPS[name]
     values = spec["quick"] if bud.quick else spec["values"]
     base = Cfg(n_rec=bud.ref_n)
@@ -423,13 +459,17 @@ def aggregate(records: List[dict]) -> Dict[str, Dict[object, dict]]:
     for (m, x), rs in groups.items():
         ok = [r for r in rs if not math.isnan(r["acc"])]
         acc = [r["acc"] for r in ok]
-        out.setdefault(m, {})[x] = dict(
+        entry = dict(
             acc=statistics.mean(acc) if acc else float("nan"),
             std=statistics.stdev(acc) if len(acc) > 1 else 0.0,
             n=len(acc),
             seconds=statistics.mean([r["seconds"] for r in ok]) if ok else float("nan"),
             rate_hz=statistics.mean([r["rate_hz"] for r in ok]) if ok else float("nan"),
         )
+        bpc = [r["bpc"] for r in ok if "bpc" in r]              # language-model sweep only
+        if bpc:
+            entry.update(bpc=statistics.mean(bpc), bpc_std=statistics.stdev(bpc) if len(bpc) > 1 else 0.0)
+        out.setdefault(m, {})[x] = entry
     return out
 
 
@@ -438,16 +478,115 @@ TABLE_COLUMNS = ("sweep", "x", "method", "acc_mean", "acc_std", "n_seeds", "trai
 
 def table_rows(sweep: str, agg: Dict[str, Dict[object, dict]]) -> List[dict]:
     """The table view of a figure (also what ends up in the CSV)."""
-    return [dict(sweep=sweep, x=x, method=m, acc_mean=round(a["acc"], 4), acc_std=round(a["std"], 4),
-                 n_seeds=a["n"], train_seconds=round(a["seconds"], 2), rate_hz=round(a["rate_hz"], 2))
-            for m, by_x in agg.items() for x, a in by_x.items()]
+    rows = []
+    for m, by_x in agg.items():
+        for x, a in by_x.items():
+            row = dict(sweep=sweep, x=x, method=m, acc_mean=round(a["acc"], 4), acc_std=round(a["std"], 4),
+                       n_seeds=a["n"], train_seconds=round(a["seconds"], 2), rate_hz=round(a["rate_hz"], 2))
+            if "bpc" in a:
+                row.update(bpc_mean=round(a["bpc"], 4), bpc_std=round(a["bpc_std"], 4))
+            rows.append(row)
+    return rows
 
 
 def write_csv(path: str, sweep: str, agg: Dict[str, Dict[object, dict]]) -> None:
+    rows = table_rows(sweep, agg)
+    cols = list(rows[0]) if rows else list(TABLE_COLUMNS)
     with open(path, "w") as f:
-        f.write(",".join(TABLE_COLUMNS) + "\n")
-        for row in table_rows(sweep, agg):
-            f.write(",".join(str(row[c]) for c in TABLE_COLUMNS) + "\n")
+        f.write(",".join(cols) + "\n")
+        for row in rows:
+            f.write(",".join(str(row[c]) for c in cols) + "\n")
+
+
+# --------------------------------------------------------------------------- #
+# Language-model sweep: spiking updates per token
+# --------------------------------------------------------------------------- #
+LM_LR_CANDIDATES = [1e-3, 2e-3, 4e-3, 8e-3]
+
+
+def _lm_args(bud: Budget, k: int, seed: int) -> SimpleNamespace:
+    """The settings run_training() and make_spiking() read, for one steps-per-token value."""
+    return SimpleNamespace(
+        seq_len=bud.lm_seq, weight_decay=0.0, warmup=50, min_lr_ratio=0.1, grad_clip=1.0,
+        rate_target=0.05, rate_weight=bud.rate_weight, no_calibrate=False,
+        d_emb=bud.lm_d_emb, n_rec=bud.lm_n_rec, exc_fraction=0.8, connectivity=0.1,
+        neuron="alif", neuron_kwargs=None, steps_per_token=k, dropout=0.1, seed=seed)
+
+
+def _lm_data(bud: Budget):
+    """Character-level text split into train / validation / test streams (on DEVICE)."""
+    text = load_text(bud.lm_data, "data")
+    tok = CharTokenizer.from_text(text)
+    train_ids, val_ids, test_ids = split_ids(torch.from_numpy(tok.encode(text)), 0.05, 0.05)
+    T = bud.lm_seq
+    vb, tb = max(1, min(32, len(val_ids) // (T + 1))), max(1, min(32, len(test_ids) // (T + 1)))
+    streams = batchify(train_ids, bud.lm_batch, DEVICE)
+    val, test = batchify(val_ids, vb, DEVICE), batchify(test_ids, tb, DEVICE)
+    if min(streams.shape[1], val.shape[1], test.shape[1]) <= T + 1:
+        raise ValueError("language-model text too short for lm_seq / lm_batch; lower them")
+    return tok, streams, val, test
+
+
+def lm_run(bud: Budget, k: int, lr: float, seed: int, data, steps: int, tune: bool = False) -> dict:
+    """Train the spiking LM with ``k`` updates per token. Tuning runs return the validation
+    loss; real runs return test accuracy / bits per character of the best-validation weights."""
+    tok, streams, val, test = data
+    args = _lm_args(bud, k, seed)
+    torch.manual_seed(seed)
+    model = make_spiking(args, tok.vocab_size, DEVICE, streams)      # moved to DEVICE, rate-calibrated
+    hist, best = run_training(f"lm k={k}", "spiking", model, lr, steps, streams, val, args, DEVICE,
+                              eval_every=steps if tune else max(1, steps // 4), log_every=10 ** 9,
+                              eval_chunks=bud.lm_eval_chunks, seed=seed)
+    if best is None or hist.get("diverged"):
+        raise RuntimeError(f"language-model training diverged (k={k}, lr={lr:g})")
+    if tune:
+        return dict(val_loss=hist["val"][-1]["loss"])
+    model.load_state_dict(best)
+    ev = lm_evaluate("spiking", model, test, bud.lm_seq)
+    return dict(acc=ev["acc"], bpc=ev["bpc"], seconds=hist["train_time"],
+                rate_hz=ev["rate"] * 1000.0 / model.cfg.dt, gain=float("nan"))
+
+
+def lm_learning_rate(bud: Budget, data, store: HPStore) -> float:
+    """Tune the learning rate once, at k = 1, before the sweep (cached like the other searches)."""
+    key = f"lm|steps|{bud.lm_data}|{bud.lm_n_rec}|{bud.lm_seq}|{bud.lm_batch}|{bud.lm_tune_steps}"
+    if key in store.data:
+        return store.data[key]["hp"]["lr"]
+    trials = []
+    for lr in ([2e-3, 4e-3] if bud.quick else LM_LR_CANDIDATES):
+        try:
+            v = lm_run(bud, 1, lr, 1000, data, bud.lm_tune_steps, tune=True)["val_loss"]
+        except Exception:
+            traceback.print_exc()
+            FAILURES.append(f"lm tuning lr={lr:g}")
+            v = float("inf")
+        trials.append(dict(lr=lr, val_loss=v))
+        print(f"[tune lm] lr {lr:g}: validation loss {v:.4f}", flush=True)
+    best = min(trials, key=lambda t: t["val_loss"])
+    store.put(key, dict(hp=dict(lr=best["lr"]), trials=trials))
+    return best["lr"]
+
+
+def run_steps_sweep(bud: Budget, store: HPStore) -> List[dict]:
+    spec = SWEEPS["steps"]
+    values = spec["quick"] if bud.quick else spec["values"]
+    data = _lm_data(bud)
+    lr = lm_learning_rate(bud, data, store)
+    print(f"[steps] learning rate {lr:g}; {bud.lm_steps} steps of {bud.lm_batch * bud.lm_seq:,} tokens per run",
+          flush=True)
+    records: List[dict] = []
+    for k in values:
+        for s in range(bud.lm_seeds):
+            try:
+                r = lm_run(bud, k, lr, s, data, bud.lm_steps)
+            except Exception:
+                traceback.print_exc()
+                FAILURES.append(f"steps k={k} seed={s}")
+                r = dict(acc=float("nan"), bpc=float("nan"), seconds=float("nan"),
+                         rate_hz=float("nan"), gain=float("nan"))
+            records.append(dict(x=k, method="spiking", seed=s, **r))
+            print(f"[steps] k={k} seed={s}: acc={r['acc']:.3f} bpc={r['bpc']:.3f} {r['seconds']:.0f}s", flush=True)
+    return records
 
 
 # --------------------------------------------------------------------------- #
@@ -664,7 +803,41 @@ def plot_method(path, spec, agg, values, meta):
     _finish(fig, plt, path)
 
 
-PLOTTERS = {"lines": plot_lines, "bars": plot_bars, "method": plot_method}
+def plot_steps(path, spec, agg, values, meta):
+    """Language-model sweep: accuracy, bits per character and training time against the number
+    of spiking updates per token (three panels with their own axes, never a dual axis)."""
+    import numpy as np
+    plt = _mpl()
+    fig = plt.figure(figsize=(12.4, 4.4), dpi=DPI, facecolor=SURFACE)
+    by_x = agg.get("spiking", {})
+    xs = np.array(values, dtype=float)
+    panels = [("acc", "std", "Test next-character accuracy", True, 0.07),
+              ("bpc", "bpc_std", "Test bits / char (lower = better)", False, 0.40),
+              ("seconds", None, "Training time (s)", False, 0.73)]
+    for key, std_key, ylabel, pct, x0 in panels:
+        mean = np.array([by_x.get(v, {}).get(key, np.nan) for v in values], dtype=float)
+        std = np.array([by_x.get(v, {}).get(std_key, 0.0) if std_key else 0.0 for v in values], dtype=float)
+        finite = np.isfinite(mean)
+        lo = float((mean - std)[finite].min()) if finite.any() else 0.0
+        hi = float((mean + std)[finite].max()) if finite.any() else 1.0
+        pad = 0.08 * (hi - lo or 1.0)
+        ylim = (0.0, hi + pad) if key == "seconds" else (max(0.0, lo - pad), hi + pad)
+        ax = _new_axes(fig, [x0, 0.20, 0.25, 0.58], ylim, ylabel, pct=pct)
+        ax.set_xlim(xs.min() - 0.4, xs.max() + 0.4)
+        ax.set_xticks(xs)
+        ax.set_xticklabels([_fmt(v) for v in values])
+        ax.set_xlabel(spec["xlabel"], fontsize=8.5, color=SECONDARY, labelpad=6)
+        ax.fill_between(xs, mean - std, mean + std, color=SINGLE, alpha=0.10, linewidth=0, zorder=2)
+        ax.plot(xs, mean, color=SINGLE, linewidth=1.8, solid_capstyle="round", solid_joinstyle="round",
+                marker="o", markersize=7, markeredgecolor=SURFACE, markeredgewidth=1.5, zorder=3)
+    _titles(fig, spec["title"],
+            f"Spiking E/I language model ({meta.get('lm_n_rec', '?')} adaptive-LIF neurons), "
+            f"{meta.get('lm_steps', '?')} steps per run, mean ± s.d. over {meta.get('lm_seeds', '?')} seeds. "
+            f"Each token drives the network for k updates; the k readouts are averaged.")
+    _finish(fig, plt, path)
+
+
+PLOTTERS = {"lines": plot_lines, "bars": plot_bars, "method": plot_method, "steps": plot_steps}
 
 
 def make_outputs(out: Optional[str], name: str, records: List[dict], meta: dict) -> List[dict]:
