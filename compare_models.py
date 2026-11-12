@@ -29,6 +29,12 @@ Fairness
 * The best-validation weights of each model are evaluated on held-out TEST text.
 * Training time is wall-clock time spent in training steps only (CUDA-synchronised; evaluation
   time is excluded).
+* The spiking model's updates per token (--steps-per-token) are chosen automatically
+  ("auto", the default): short validation runs of k = 1..--spt-max, same data and budget,
+  and the k with the lowest validation loss wins (ties within --spt-tolerance go to the
+  smaller k, since cost grows with k). The learning rate is then tuned at that k. The
+  trials (loss and time per k) are saved in history.json, so the cost/benefit is visible.
+  Pass an integer to fix k instead.
 Caveat: the spiking network is stateful (its state carries across chunks, so its effective
 context is unbounded); the transformer sees windows of --seq-len tokens, evaluated chunk by
 chunk exactly as it is trained. That is the standard transformer setting, but it means the two
@@ -216,6 +222,69 @@ def transformer_config(args, vocab: int, target: int) -> TransformerConfig:
     return match_transformer(target, vocab, args.seq_len, args.n_layer, args.n_head, args.dropout)
 
 
+def _spt_arg(text: str):
+    """argparse type for --steps-per-token: 'auto' or a positive integer."""
+    if text == "auto":
+        return text
+    try:
+        k = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected 'auto' or a positive integer")
+    if k < 1:
+        raise argparse.ArgumentTypeError("steps per token must be at least 1")
+    return k
+
+
+# everything that changes which k wins; a saved selection is only reused if all of it matches
+_SPT_SIGNATURE_FIELDS = ("data", "n_rec", "d_emb", "exc_fraction", "connectivity", "neuron", "neuron_kwargs",
+                         "seq_len", "batch_size", "dropout", "rate_target", "rate_weight", "seed", "spt_max",
+                         "spt_steps", "tune_steps", "spt_seeds", "spt_lr", "spt_tolerance", "warmup",
+                         "min_lr_ratio", "weight_decay", "grad_clip")
+
+
+def spt_signature(args) -> dict:
+    return {f: getattr(args, f, None) for f in _SPT_SIGNATURE_FIELDS}
+
+
+def pick_steps_per_token(trials: List[dict], tolerance: float = 0.0) -> int:
+    """The k with the lowest validation loss; any k within ``tolerance`` (relative) of the best
+    loses to a smaller k, because each extra update per token costs proportionally more compute."""
+    ok = [t for t in trials if math.isfinite(t["val_loss"])]
+    if not ok:
+        raise RuntimeError("every steps-per-token trial diverged; lower --spt-lr")
+    best = min(t["val_loss"] for t in ok)
+    return min(t["k"] for t in ok if t["val_loss"] <= best * (1.0 + tolerance))
+
+
+def select_steps_per_token(args, vocab: int, device, streams, val_streams) -> dict:
+    """Short validation runs for k = 1..spt_max (identical data and step budget; the learning rate
+    is fixed at --spt-lr, then tuned afterwards at the chosen k). Returns the trials and the choice."""
+    candidates = list(range(1, args.spt_max + 1))
+    steps = args.spt_steps or args.tune_steps
+    trials = []
+    for k in candidates:
+        losses, secs = [], []
+        for sd in range(args.spt_seeds):
+            a = copy.copy(args)
+            a.steps_per_token, a.seed = k, args.seed + sd
+            torch.manual_seed(a.seed)
+            model = make_spiking(a, vocab, device, streams)
+            h, _ = run_training(f"steps/token k={k}", "spiking", model, args.spt_lr, steps, streams, val_streams,
+                                a, device, eval_every=steps, log_every=10 ** 9, eval_chunks=args.eval_chunks,
+                                seed=a.seed)
+            diverged = h.get("diverged") or not h["val"]
+            losses.append(float("inf") if diverged else h["val"][-1]["loss"])
+            secs.append(h.get("train_time", float("nan")))
+            del model
+        loss = sum(losses) / len(losses)
+        trials.append(dict(k=k, val_loss=loss, val_bpc=loss / math.log(2), seconds=sum(secs) / len(secs)))
+        print(f"[steps/token] k={k}: validation bpc {loss / math.log(2):.3f} | {trials[-1]['seconds']:.0f}s",
+              flush=True)
+    k = pick_steps_per_token(trials, args.spt_tolerance)
+    print(f"[steps/token] selected k = {k}", flush=True)
+    return dict(k=k, trials=trials, signature=spt_signature(args))
+
+
 # --------------------------------------------------------------------------- #
 # Figures (shared style with tests.py: validated palette, legend + direct labels, table view)
 # --------------------------------------------------------------------------- #
@@ -253,6 +322,16 @@ def _line_panel(fig, rect, vis, curves, xlabel, ylabel, xlog=False, end_labels=F
     return ax
 
 
+def _label(history: dict, m: str) -> str:
+    k = history["models"][m].get("steps_per_token")
+    return f"{LABEL[m]}, {k} updates/token" if k else LABEL[m]
+
+
+def _short(history: dict, m: str) -> str:
+    k = history["models"][m].get("steps_per_token")
+    return SHORT[m].replace("RSNN", f"RSNN (k={k})") if k else SHORT[m]
+
+
 def plot_loss_curves(history: dict, path: Optional[str]) -> None:
     from matplotlib.lines import Line2D
     vis = _vis()
@@ -271,7 +350,7 @@ def plot_loss_curves(history: dict, path: Optional[str]) -> None:
                 [(m, [e["time"] for e in trn[m]], [e["bpc"] for e in trn[m]], False) for m in models],
                 "Training time (s, log scale)", "Training bits / char", xlog=True)
     handles = [Line2D([0], [0], color=COLOR[m], linewidth=1.8, marker=MARKER[m], markersize=7,
-                      markeredgecolor=vis.SURFACE, markeredgewidth=1.5, label=LABEL[m]) for m in models]
+                      markeredgecolor=vis.SURFACE, markeredgewidth=1.5, label=_label(history, m)) for m in models]
     fig.legend(handles=handles, loc="lower center", ncol=len(models), frameon=False, fontsize=8.5,
                labelcolor=vis.SECONDARY, bbox_to_anchor=(0.5, 0.01), handlelength=2.2, columnspacing=2.0)
     a = history["args"]
@@ -281,13 +360,13 @@ def plot_loss_curves(history: dict, path: Optional[str]) -> None:
     vis._finish(fig, plt, path)
 
 
-def _bar_panel(fig, rect, vis, models, values, ylim, ylabel, fmt, pct=False):
+def _bar_panel(fig, rect, vis, models, values, ylim, ylabel, fmt, pct=False, names=None):
     import numpy as np
     ax = vis._new_axes(fig, rect, ylim, ylabel, pct=pct)
     n = len(models)
     ax.set_xlim(-0.6, n - 0.4)
     ax.set_xticks(range(n))
-    ax.set_xticklabels([SHORT[m] for m in models])
+    ax.set_xticklabels(names or [SHORT[m] for m in models])
     bb = ax.get_window_extent()
     width = (24.0 * vis.DPI / 100.0) * (n + 0.2) / bb.width       # bars are at most 24 css px wide
     span = ylim[1] - ylim[0]
@@ -308,12 +387,13 @@ def plot_final(history: dict, path: Optional[str]) -> None:
     acc = [fin[m]["test"]["acc"] for m in models]
     bpc = [fin[m]["test"]["bpc"] for m in models]
     sec = [history["models"][m]["hist"].get("train_time") for m in models]
+    names = [_short(history, m) for m in models]
     _bar_panel(fig, [0.06, 0.2, 0.26, 0.58], vis, models, acc, (0.0, min(1.0, max(acc) * 1.25)),
-               "Test next-character accuracy", lambda v: f"{v:.1%}", pct=True)
+               "Test next-character accuracy", lambda v: f"{v:.1%}", pct=True, names=names)
     _bar_panel(fig, [0.40, 0.2, 0.26, 0.58], vis, models, bpc, (0.0, max(bpc) * 1.2),
-               "Test bits / char (lower = better)", lambda v: f"{v:.2f}")
+               "Test bits / char (lower = better)", lambda v: f"{v:.2f}", names=names)
     _bar_panel(fig, [0.74, 0.2, 0.24, 0.58], vis, models, sec, (0.0, max(s for s in sec if s) * 1.2),
-               "Total training time (s)", lambda v: f"{v:.0f}s")
+               "Total training time (s)", lambda v: f"{v:.0f}s", names=names)
     p = history["params"]
     vis._titles(fig, "Final comparison on held-out text",
                 f"Trainable parameters: spiking {p['spiking_trainable']:,} (stored {p['spiking_stored']:,}); "
@@ -328,7 +408,8 @@ def comparison_rows(history: dict) -> List[dict]:
         e = history["models"][m]
         h, f = e["hist"], e["final"]
         rows.append(dict(
-            model=LABEL[m], lr=e["lr"], trainable_params=e["trainable_params"], stored_params=e["stored_params"],
+            model=LABEL[m], steps_per_token=e.get("steps_per_token") or "-", lr=e["lr"],
+            trainable_params=e["trainable_params"], stored_params=e["stored_params"],
             tokens=h.get("tokens"), train_seconds=round(h.get("train_time", float("nan")), 1),
             tokens_per_s=round(h.get("tokens_per_s", float("nan"))),
             best_val_bpc=round(f["val"]["bpc"], 4), test_bpc=round(f["test"]["bpc"], 4),
@@ -379,7 +460,14 @@ def parse_args(argv=None):
     s.add_argument("--connectivity", type=float, default=0.05)
     s.add_argument("--neuron", default="alif", choices=["if", "lif", "alif", "stochastic_lif", "izhikevich"])
     s.add_argument("--neuron-kwargs", default=None)
-    s.add_argument("--steps-per-token", type=int, default=1)
+    s.add_argument("--steps-per-token", type=_spt_arg, default="auto",
+                   help="spiking updates per token: an integer, or 'auto' (default) to pick the best 1..--spt-max")
+    s.add_argument("--spt-max", type=int, default=8, help="largest k tried by 'auto'")
+    s.add_argument("--spt-steps", type=int, default=None, help="length of each trial (default: --tune-steps)")
+    s.add_argument("--spt-seeds", type=int, default=1, help="seeds per k (more = less noisy choice, slower)")
+    s.add_argument("--spt-lr", type=float, default=2e-3, help="learning rate used while choosing k")
+    s.add_argument("--spt-tolerance", type=float, default=0.0,
+                   help="prefer a smaller k whose validation loss is within this relative margin of the best")
     s.add_argument("--rate-target", type=float, default=0.05)
     s.add_argument("--rate-weight", type=float, default=50.0)
     s.add_argument("--no-calibrate", action="store_true")
@@ -421,6 +509,7 @@ def parse_args(argv=None):
         args.data, args.n_rec, args.d_emb, args.seq_len, args.batch_size = "builtin", 128, 32, 32, 16
         args.max_steps, args.eval_every, args.eval_chunks, args.log_every = 30, 10, 3, 10
         args.tune_steps, args.warmup, args.sample_len = 10, 5, 80
+        args.spt_max, args.spt_steps = 2, 10
         LR_CANDIDATES["spiking"], LR_CANDIDATES["transformer"] = [1e-3, 4e-3], [1e-3, 6e-3]
         args.out = args.out if args.out != "results_compare" else "results_compare_quick"
     return args
@@ -460,6 +549,22 @@ def main(argv=None) -> int:
           f"= {total_steps * B * T / 1e6:.1f}M training tokens per model")
 
     # ---- parameter matching --------------------------------------------------- #
+    # ---- steps per token: fixed, or chosen by validation ---------------------------------- #
+    spiking_pending = "spiking" in args.models and ("spiking" not in history["models"] or args.force)
+    if args.steps_per_token == "auto":
+        if spiking_pending:
+            sel = history.get("spt_selection")
+            if sel is None or sel.get("signature") != spt_signature(args) or args.force:
+                sel = select_steps_per_token(args, V, device, streams, val_streams)
+                history["spt_selection"] = sel
+                json.dump(history, open(hist_path, "w"), indent=1)      # resume point
+            else:
+                print(f"[steps/token] reusing saved selection: k = {sel['k']}")
+            args.steps_per_token = sel["k"]
+        else:                                                           # spiking already trained
+            args.steps_per_token = history["models"].get("spiking", {}).get("steps_per_token") or 1
+    print(f"spiking updates per token: {args.steps_per_token}")
+
     torch.manual_seed(args.seed)
     ref = make_spiking(args, V, torch.device("cpu"))              # only for the counts
     p_train, p_stored = ref.num_effective_parameters, ref.num_parameters
@@ -522,6 +627,7 @@ def main(argv=None) -> int:
               f"next-char accuracy {final['test']['acc']:.1%}")
         sample = sample_text(model, tok, args.prompt, args.sample_len, args.temperature, args.top_k, device)
         history["models"][name] = dict(lr=lr, tuning=tuning, trainable_params=trainable, stored_params=stored,
+                                       steps_per_token=args.steps_per_token if name == "spiking" else None,
                                        hist=hist, final=final, sample=sample)
         json.dump(history, open(hist_path, "w"), indent=1)       # resume point
         del model, best
