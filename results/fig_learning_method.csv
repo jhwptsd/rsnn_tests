@@ -1,0 +1,6 @@
+sweep,x,method,acc_mean,acc_std,n_seeds,train_seconds,rate_hz
+method,reservoir,reservoir,0.6497,0.0185,3,2.09,15.8
+method,stdp,stdp,0.5469,0.1184,3,2.75,16.33
+method,rstdp,rstdp,0.5703,0.0489,3,5.26,18.67
+method,eprop,eprop,0.6068,0.0163,3,7.51,22.6
+method,bptt,bptt,0.9896,0.006,3,11.76,24.86
