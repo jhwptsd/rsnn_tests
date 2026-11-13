@@ -3,4 +3,3 @@ __pycache__/
 data/
 checkpoints*/
 *.pt
-results_compare*/

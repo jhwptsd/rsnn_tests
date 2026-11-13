@@ -1,0 +1,5 @@
+| model | steps_per_token | lr | n_seeds | trainable_params | stored_params | tokens | train_seconds | train_seconds_std | tokens_per_s | best_val_bpc | test_bpc | test_bpc_std | test_bpc_ci95 | test_perplexity | test_accuracy | test_accuracy_std | test_accuracy_ci95 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| Spiking RSNN | - | 0.008 | 3 | 258400 | 1254593 | 9994240 | 6298.5 | 3715.1 | 1927.0 | 2.9134 | 2.9911 | 0.0049 | 0.0123 | 7.951 | 0.4031 | 0.0024 | 0.006 |
+| Transformer (matched trainable params) | - | 0.006 | 3 | 258340 | 258340 | 9994240 | 1128.0 | 168.5 | 8984.0 | 2.5501 | 2.6447 | 0.026 | 0.0646 | 6.254 | 0.4568 | 0.0057 | 0.0143 |
+| Transformer (matched stored params) | - | 0.003 | 3 | 1254196 | 1254196 | 9994240 | 2125.5 | 571.2 | 4909.0 | 2.2136 | 2.3867 | 0.0063 | 0.0157 | 5.23 | 0.5133 | 0.0014 | 0.0034 |
