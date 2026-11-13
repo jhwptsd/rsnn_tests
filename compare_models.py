@@ -26,7 +26,14 @@ Fairness
   optimiser (AdamW), warm-up + cosine schedule, gradient clipping and number of steps/tokens.
 * The learning rate is tuned separately for each model (short validation runs) before the
   real runs; skip with --no-tune or fix with --lr-spiking / --lr-transformer.
-* The best-validation weights of each model are evaluated on held-out TEST text.
+* Every model is trained on --seeds different seeds (default 3: different initialisation, dropout
+  and data order; the data order for a given seed is the same for every model, so runs are paired).
+  The learning rate (and the spiking model's updates per token) are chosen once, at the base seed,
+  and reused. Curves show the mean with a +-1 s.d. band; bars show the mean, the s.d. and each seed's
+  result; the table reports the mean, s.d. and a 95% t-interval. With only 3 seeds that interval is
+  wide (about 2.5 s.d.), which is the honest size of the uncertainty. Models can be added seed by
+  seed: re-running with a larger --seeds only trains the missing runs.
+* The best-validation weights of each run are evaluated on held-out TEST text.
 * Training time is wall-clock time spent in training steps only (CUDA-synchronised; evaluation
   time is excluded).
 * The spiking model's updates per token (--steps-per-token) are chosen automatically
@@ -53,6 +60,7 @@ import json
 import math
 import os
 import random
+import statistics
 import sys
 import time
 from dataclasses import asdict
@@ -288,22 +296,84 @@ def select_steps_per_token(args, vocab: int, device, streams, val_streams) -> di
 # --------------------------------------------------------------------------- #
 # Figures (shared style with tests.py: validated palette, legend + direct labels, table view)
 # --------------------------------------------------------------------------- #
+# two-sided 95% critical values of Student's t by degrees of freedom (n seeds -> df = n - 1)
+_T95 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365, 8: 2.306, 9: 2.262,
+        10: 2.228, 12: 2.179, 15: 2.131, 20: 2.086, 30: 2.042}
+
+
+def _stats(values) -> tuple:
+    """(mean, sample s.d., 95% half-width, n) ignoring missing / non-finite values. With one value the
+    s.d. is 0 and the interval is undefined (NaN)."""
+    v = [x for x in values if x is not None and math.isfinite(x)]
+    n = len(v)
+    if n == 0:
+        return float("nan"), float("nan"), float("nan"), 0
+    mean = sum(v) / n
+    if n == 1:
+        return mean, 0.0, float("nan"), 1
+    sd = statistics.stdev(v)
+    df = n - 1
+    t = _T95[max(k for k in _T95 if k <= df)] if df <= 30 else 1.96
+    return mean, sd, t * sd / math.sqrt(n), n
+
+
+def _runs(entry: dict, default_seed: int = 0) -> List[dict]:
+    """The per-seed runs of a model entry. Also reads the older single-run layout."""
+    if "runs" in entry:
+        return entry["runs"]
+    return [dict(seed=entry.get("seed", default_seed), hist=entry["hist"], final=entry["final"],
+                 trainable_params=entry["trainable_params"], stored_params=entry["stored_params"])]
+
+
+def plan_seeds(entry: Optional[dict], seeds: List[int], default_seed: int = 0) -> tuple:
+    """(existing runs, seeds still to train). Lets a bigger --seeds extend a finished model."""
+    runs = _runs(entry, default_seed) if entry else []
+    done = {r["seed"] for r in runs}
+    return runs, [sd for sd in seeds if sd not in done]
+
+
+def _curve(entry: dict, which: str) -> Optional[dict]:
+    """Mean and s.d. across seeds of a logged curve ('val' or 'train'). Every seed logs on the same step
+    grid, so curves are aligned by index (times are averaged too)."""
+    import numpy as np
+    curves = [r["hist"][which] for r in _runs(entry) if r["hist"].get(which)]
+    if not curves:
+        return None
+    n = min(len(c) for c in curves)
+    arr = lambda key: np.array([[e[key] for e in c[:n]] for c in curves], dtype=float)
+    bpc = arr("bpc")
+    return dict(time=arr("time").mean(0), tokens=arr("tokens").mean(0), bpc=bpc.mean(0),
+                std=bpc.std(0, ddof=1) if len(curves) > 1 else np.zeros(n), n=len(curves))
+
+
+def _seed_text(history: dict, models: List[str]) -> str:
+    ns = sorted({len(_runs(history["models"][m])) for m in models})
+    return "/".join(str(n) for n in ns) + (" seed" if ns == [1] else " seeds")
+
+
 def _vis():
     import tests                                                  # plotting helpers live there
     return tests
 
 
 def _line_panel(fig, rect, vis, curves, xlabel, ylabel, xlog=False, end_labels=False):
-    """curves: [(model, xs, ys, with_markers)]. One axis per panel (never dual-axis)."""
+    """curves: [(model, xs, ys, with_markers[, std])]; a std draws a +-1 s.d. band. One axis per panel
+    (never dual-axis)."""
     import numpy as np
-    ys_all = [y for _, _, ys, _ in curves for y in ys if np.isfinite(y)]
+    curves = [tuple(c) + (None,) * (5 - len(c)) for c in curves]
+    ys_all = [y for _, _, ys, _, sd in curves
+              for y in (list(np.asarray(ys) - np.asarray(sd)) + list(np.asarray(ys) + np.asarray(sd))
+                        if sd is not None else ys) if np.isfinite(y)]
     lo, hi = (min(ys_all), max(ys_all)) if ys_all else (0.0, 1.0)
     pad = 0.06 * (hi - lo or 1.0)
     ax = vis._new_axes(fig, rect, (max(0.0, lo - pad), hi + pad), ylabel, pct=False)
-    xs_all = [x for _, xs, _, _ in curves for x in xs if np.isfinite(x) and x > 0]
+    xs_all = [x for _, xs, _, _, _ in curves for x in xs if np.isfinite(x) and x > 0]
     if xlog:
         ax.set_xscale("log")
-    for name, xs, ys, markers in curves:
+    for name, xs, ys, markers, sd in curves:
+        if sd is not None and np.any(np.asarray(sd) > 0):
+            ax.fill_between(xs, np.asarray(ys) - np.asarray(sd), np.asarray(ys) + np.asarray(sd),
+                            color=COLOR[name], alpha=0.10, linewidth=0, zorder=2)
         ax.plot(xs, ys, color=COLOR[name], linewidth=1.8, solid_capstyle="round", solid_joinstyle="round",
                 marker=MARKER[name] if markers else None, markersize=7, markeredgecolor=vis.SURFACE,
                 markeredgewidth=1.5, zorder=3)
@@ -313,7 +383,7 @@ def _line_panel(fig, rect, vis, curves, xlabel, ylabel, xlog=False, end_labels=F
             ax.set_xlim(x_min / 1.1, x_max * 1.15)
         else:                                          # room on the right for the end labels
             ax.set_xlim(0.0, x_max + (0.5 if end_labels else 0.05) * (x_max - x_min))
-    ends = sorted((ys[-1], name, xs[-1]) for name, xs, ys, _ in curves if len(ys))
+    ends = sorted((ys[-1], name, xs[-1]) for name, xs, ys, _, _ in curves if len(ys))
     if end_labels and len(ends) > 1 and min(b[0] - a[0] for a, b in zip(ends, ends[1:])) >= 0.1 * (hi - lo or 1.0):
         for y, name, x in ends:
             ax.annotate(END_LABEL[name], (x, y), xytext=(8, 0), textcoords="offset points",
@@ -338,16 +408,16 @@ def plot_loss_curves(history: dict, path: Optional[str]) -> None:
     plt = vis._mpl()
     models = [m for m in ORDER if m in history["models"]]
     fig = plt.figure(figsize=(13.2, 4.7), dpi=vis.DPI, facecolor=vis.SURFACE)
-    val = {m: history["models"][m]["hist"]["val"] for m in models}
-    trn = {m: history["models"][m]["hist"]["train"] for m in models}
+    val = {m: _curve(history["models"][m], "val") for m in models}
+    trn = {m: _curve(history["models"][m], "train") for m in models}
     _line_panel(fig, [0.055, 0.25, 0.27, 0.56], vis,
-                [(m, [e["time"] for e in val[m]], [e["bpc"] for e in val[m]], True) for m in models],
+                [(m, val[m]["time"], val[m]["bpc"], True, val[m]["std"]) for m in models if val[m]],
                 "Training time (s, log scale)", "Validation bits / char (lower = better)", xlog=True)
     _line_panel(fig, [0.385, 0.25, 0.27, 0.56], vis,
-                [(m, [e["tokens"] / 1e6 for e in val[m]], [e["bpc"] for e in val[m]], True) for m in models],
+                [(m, val[m]["tokens"] / 1e6, val[m]["bpc"], True, val[m]["std"]) for m in models if val[m]],
                 "Training tokens seen (millions)", "Validation bits / char", end_labels=True)
     _line_panel(fig, [0.75, 0.25, 0.235, 0.56], vis,
-                [(m, [e["time"] for e in trn[m]], [e["bpc"] for e in trn[m]], False) for m in models],
+                [(m, trn[m]["time"], trn[m]["bpc"], False, trn[m]["std"]) for m in models if trn[m]],
                 "Training time (s, log scale)", "Training bits / char", xlog=True)
     handles = [Line2D([0], [0], color=COLOR[m], linewidth=1.8, marker=MARKER[m], markersize=7,
                       markeredgecolor=vis.SURFACE, markeredgewidth=1.5, label=_label(history, m)) for m in models]
@@ -355,12 +425,14 @@ def plot_loss_curves(history: dict, path: Optional[str]) -> None:
                labelcolor=vis.SECONDARY, bbox_to_anchor=(0.5, 0.01), handlelength=2.2, columnspacing=2.0)
     a = history["args"]
     vis._titles(fig, "Spiking RSNN vs transformer: loss against training time and data",
-                f"{a['data']}, same data order, optimiser and schedule for every model; "
-                f"{a['seq_len']}-token chunks, batch {a['batch_size']}. Markers = validation checkpoints.")
+                f"{a['data']}, same optimiser and schedule for every model; {a['seq_len']}-token chunks, "
+                f"batch {a['batch_size']}. Line = mean over {_seed_text(history, models)}, band = +-1 s.d., "
+                f"markers = validation checkpoints.")
     vis._finish(fig, plt, path)
 
 
-def _bar_panel(fig, rect, vis, models, values, ylim, ylabel, fmt, pct=False, names=None):
+def _bar_panel(fig, rect, vis, models, values, ylim, ylabel, fmt, pct=False, names=None, stds=None,
+               points=None):
     import numpy as np
     ax = vis._new_axes(fig, rect, ylim, ylabel, pct=pct)
     n = len(models)
@@ -374,7 +446,19 @@ def _bar_panel(fig, rect, vis, models, values, ylim, ylabel, fmt, pct=False, nam
         if v is None or not np.isfinite(v):
             continue
         vis._round_bar(ax, i, v, width, COLOR[m])
-        ax.text(i, v + 0.015 * span, fmt(v), fontsize=8, color=vis.PRIMARY, ha="center", va="bottom", zorder=5)
+        top = v
+        sd = stds[i] if stds is not None else None
+        if sd is not None and np.isfinite(sd) and sd > 0:                 # +-1 s.d. across seeds
+            ax.plot([i, i], [max(v - sd, 0.0), v + sd], color=vis.SECONDARY, linewidth=1.0,
+                    solid_capstyle="butt", zorder=4)
+            top = v + sd
+        pts = [x for x in (points[i] if points is not None else []) if x is not None and np.isfinite(x)]
+        if len(pts) > 1:                                                  # one dot per seed (the raw data)
+            xs = i + (np.arange(len(pts)) - (len(pts) - 1) / 2) * (width * 0.28)
+            ax.plot(xs, pts, linestyle="none", marker="o", markersize=5, markerfacecolor=vis.SURFACE,
+                    markeredgecolor=vis.PRIMARY, markeredgewidth=0.9, zorder=6)
+            top = max(top, max(pts))
+        ax.text(i, top + 0.015 * span, fmt(v), fontsize=8, color=vis.PRIMARY, ha="center", va="bottom", zorder=5)
     return ax
 
 
@@ -382,38 +466,62 @@ def plot_final(history: dict, path: Optional[str]) -> None:
     vis = _vis()
     plt = vis._mpl()
     models = [m for m in ORDER if m in history["models"]]
-    fin = {m: history["models"][m]["final"] for m in models}
     fig = plt.figure(figsize=(11.6, 4.5), dpi=vis.DPI, facecolor=vis.SURFACE)
-    acc = [fin[m]["test"]["acc"] for m in models]
-    bpc = [fin[m]["test"]["bpc"] for m in models]
-    sec = [history["models"][m]["hist"].get("train_time") for m in models]
     names = [_short(history, m) for m in models]
-    _bar_panel(fig, [0.06, 0.2, 0.26, 0.58], vis, models, acc, (0.0, min(1.0, max(acc) * 1.25)),
-               "Test next-character accuracy", lambda v: f"{v:.1%}", pct=True, names=names)
-    _bar_panel(fig, [0.40, 0.2, 0.26, 0.58], vis, models, bpc, (0.0, max(bpc) * 1.2),
-               "Test bits / char (lower = better)", lambda v: f"{v:.2f}", names=names)
-    _bar_panel(fig, [0.74, 0.2, 0.24, 0.58], vis, models, sec, (0.0, max(s for s in sec if s) * 1.2),
-               "Total training time (s)", lambda v: f"{v:.0f}s", names=names)
+    runs = {m: _runs(history["models"][m]) for m in models}
+    per_run = {"acc": [[r["final"]["test"]["acc"] for r in runs[m]] for m in models],
+               "bpc": [[r["final"]["test"]["bpc"] for r in runs[m]] for m in models],
+               "sec": [[r["hist"].get("train_time") for r in runs[m]] for m in models]}
+    stat = {k: [_stats(v) for v in vals] for k, vals in per_run.items()}
+
+    def top(key):                                   # axis headroom for the mean + s.d. and every dot
+        highs = [max([mean + (sd if math.isfinite(sd) else 0.0)] + [x for x in pts if x is not None])
+                 for (mean, sd, _, _), pts in zip(stat[key], per_run[key]) if math.isfinite(mean)]
+        return max(highs) * 1.22
+
+    for key, rect, ylim, ylabel, fmt, pct in (
+            ("acc", [0.06, 0.2, 0.26, 0.58], (0.0, min(1.0, top("acc"))), "Test next-character accuracy",
+             lambda v: f"{v:.1%}", True),
+            ("bpc", [0.40, 0.2, 0.26, 0.58], (0.0, top("bpc")), "Test bits / char (lower = better)",
+             lambda v: f"{v:.2f}", False),
+            ("sec", [0.74, 0.2, 0.24, 0.58], (0.0, top("sec")), "Total training time (s)",
+             lambda v: f"{v:.0f}s", False)):
+        _bar_panel(fig, rect, vis, models, [m_ for m_, _, _, _ in stat[key]], ylim, ylabel, fmt, pct=pct,
+                   names=names, stds=[sd for _, sd, _, _ in stat[key]], points=per_run[key])
     p = history["params"]
     vis._titles(fig, "Final comparison on held-out text",
                 f"Trainable parameters: spiking {p['spiking_trainable']:,} (stored {p['spiking_stored']:,}); "
                 f"transformers {p.get('transformer_eff', 0):,} / {p.get('transformer_stored', 0):,}. "
-                f"Chance accuracy = 1/{history['vocab_size']}.")
+                f"Chance accuracy = 1/{history['vocab_size']}. Bars = mean over {_seed_text(history, models)}, "
+                f"whisker = +-1 s.d., dots = individual seeds.")
     vis._finish(fig, plt, path)
 
 
+def _r(x, nd: int):
+    return round(x, nd) if x is not None and math.isfinite(x) else "-"
+
+
 def comparison_rows(history: dict) -> List[dict]:
+    """One row per model, aggregated over its seeds (mean, s.d. and 95% t-interval half-width)."""
     rows = []
     for m in [m for m in ORDER if m in history["models"]]:
         e = history["models"][m]
-        h, f = e["hist"], e["final"]
+        runs = _runs(e)
+        col = lambda f: [f(r) for r in runs]
+        acc = _stats(col(lambda r: r["final"]["test"]["acc"]))
+        bpc = _stats(col(lambda r: r["final"]["test"]["bpc"]))
+        secs = _stats(col(lambda r: r["hist"].get("train_time")))
         rows.append(dict(
-            model=LABEL[m], steps_per_token=e.get("steps_per_token") or "-", lr=e["lr"],
-            trainable_params=e["trainable_params"], stored_params=e["stored_params"],
-            tokens=h.get("tokens"), train_seconds=round(h.get("train_time", float("nan")), 1),
-            tokens_per_s=round(h.get("tokens_per_s", float("nan"))),
-            best_val_bpc=round(f["val"]["bpc"], 4), test_bpc=round(f["test"]["bpc"], 4),
-            test_perplexity=round(f["test"]["ppl"], 3), test_accuracy=round(f["test"]["acc"], 4)))
+            model=LABEL[m], steps_per_token=e.get("steps_per_token") or "-", lr=e["lr"], n_seeds=len(runs),
+            trainable_params=round(_stats(col(lambda r: r["trainable_params"]))[0]),
+            stored_params=round(_stats(col(lambda r: r["stored_params"]))[0]),
+            tokens=runs[0]["hist"].get("tokens"),
+            train_seconds=_r(secs[0], 1), train_seconds_std=_r(secs[1], 1),
+            tokens_per_s=_r(_stats(col(lambda r: r["hist"].get("tokens_per_s")))[0], 0),
+            best_val_bpc=_r(_stats(col(lambda r: r["final"]["val"]["bpc"]))[0], 4),
+            test_bpc=_r(bpc[0], 4), test_bpc_std=_r(bpc[1], 4), test_bpc_ci95=_r(bpc[2], 4),
+            test_perplexity=_r(_stats(col(lambda r: r["final"]["test"]["ppl"]))[0], 3),
+            test_accuracy=_r(acc[0], 4), test_accuracy_std=_r(acc[1], 4), test_accuracy_ci95=_r(acc[2], 4)))
     return rows
 
 
@@ -493,7 +601,8 @@ def parse_args(argv=None):
     r.add_argument("--eval-batch", type=int, default=32)
     r.add_argument("--eval-chunks", type=int, default=40)
     r.add_argument("--log-every", type=int, default=25)
-    r.add_argument("--seed", type=int, default=0)
+    r.add_argument("--seed", type=int, default=0, help="base seed; runs use seed, seed+1, ...")
+    r.add_argument("--seeds", type=int, default=3, help="training runs per model (different seeds)")
     r.add_argument("--device", default=None)
     r.add_argument("--tf32", action=argparse.BooleanOptionalAction, default=True)
     r.add_argument("--quick", action="store_true")
@@ -509,7 +618,7 @@ def parse_args(argv=None):
         args.data, args.n_rec, args.d_emb, args.seq_len, args.batch_size = "builtin", 128, 32, 32, 16
         args.max_steps, args.eval_every, args.eval_chunks, args.log_every = 30, 10, 3, 10
         args.tune_steps, args.warmup, args.sample_len = 10, 5, 80
-        args.spt_max, args.spt_steps = 2, 10
+        args.spt_max, args.spt_steps, args.seeds = 2, 10, min(args.seeds, 2)
         LR_CANDIDATES["spiking"], LR_CANDIDATES["transformer"] = [1e-3, 4e-3], [1e-3, 6e-3]
         args.out = args.out if args.out != "results_compare" else "results_compare_quick"
     return args
@@ -582,60 +691,80 @@ def main(argv=None) -> int:
         print(f"{k}: d_model {c.d_model}, {c.n_layer} layers, {c.n_head} heads, d_ff {c.d_ff}: "
               f"{param_count(c):,} parameters ({100 * (param_count(c) - target) / target:+.2f}% vs target)")
 
-    def builder(name):
+    def builder(name, seed=None):
+        seed = args.seed if seed is None else seed
         if name == "spiking":
-            return lambda: make_spiking(args, V, device, streams)
-        return lambda: TransformerLM(tcfg[name]).to(device)
+            a = copy.copy(args)
+            a.seed = seed                                         # network masks / initial weights
+            return lambda: make_spiking(a, V, device, streams)
+        return lambda: TransformerLM(tcfg[name]).to(device)       # initialised from the global seed
 
-    # ---- train each model ----------------------------------------------------- #
+    seeds = [args.seed + i for i in range(args.seeds)]
+
+    # ---- train each model on every seed ---------------------------------------------- #
     for name in [m for m in ORDER if m in args.models]:
-        if name in history["models"] and not args.force:
-            print(f"[{name}] already in history.json, skipping (--force to retrain)")
-            continue
         kind = "spiking" if name == "spiking" else "transformer"
-        lr = args.lr_spiking if kind == "spiking" else args.lr_transformer
-        tuning = None
-        if lr is None and args.no_tune:
-            lr = 2e-3 if kind == "spiking" else 3e-3
-        elif lr is None:
-            tuning = []
-            for cand in LR_CANDIDATES[kind]:
-                torch.manual_seed(args.seed)
-                h, _ = run_training(f"tune {name} lr={cand:g}", "spiking" if kind == "spiking" else "transformer",
-                                    builder(name)(), cand, args.tune_steps, streams, val_streams, args, device,
-                                    eval_every=args.tune_steps, log_every=10 ** 9,
-                                    eval_chunks=args.eval_chunks, seed=args.seed)
-                v = h["val"][-1]["loss"] if h["val"] and not h.get("diverged") else float("inf")
-                tuning.append(dict(lr=cand, val_loss=v))
-                print(f"[tune {name}] lr {cand:g}: validation loss {v:.4f}", flush=True)
-            lr = min(tuning, key=lambda r: r["val_loss"])["lr"]
-            print(f"[{name}] selected lr {lr:g}", flush=True)
+        entry = None if args.force else history["models"].get(name)
+        runs, todo = plan_seeds(entry, seeds, history.get("args", {}).get("seed", args.seed))
+        if entry is not None:
+            if not todo:
+                print(f"[{name}] already has seeds {seeds} in history.json, skipping (--force to retrain)")
+                continue
+            entry["runs"] = runs                                  # moves a legacy single run into 'runs'
+            for legacy in ("hist", "final"):
+                entry.pop(legacy, None)
+            lr = entry["lr"]
+            print(f"[{name}] adding seeds {todo} to {len(runs)} existing run(s), lr {lr:g}")
+        else:
+            lr = args.lr_spiking if kind == "spiking" else args.lr_transformer
+            tuning = None
+            if lr is None and args.no_tune:
+                lr = 2e-3 if kind == "spiking" else 3e-3
+            elif lr is None:
+                tuning = []
+                for cand in LR_CANDIDATES[kind]:
+                    torch.manual_seed(args.seed)
+                    h, _ = run_training(f"tune {name} lr={cand:g}", kind, builder(name)(), cand, args.tune_steps,
+                                        streams, val_streams, args, device, eval_every=args.tune_steps,
+                                        log_every=10 ** 9, eval_chunks=args.eval_chunks, seed=args.seed)
+                    v = h["val"][-1]["loss"] if h["val"] and not h.get("diverged") else float("inf")
+                    tuning.append(dict(lr=cand, val_loss=v))
+                    print(f"[tune {name}] lr {cand:g}: validation loss {v:.4f}", flush=True)
+                lr = min(tuning, key=lambda r: r["val_loss"])["lr"]
+                print(f"[{name}] selected lr {lr:g}", flush=True)
+            entry = dict(lr=lr, tuning=tuning, runs=[], sample=None,
+                         steps_per_token=args.steps_per_token if name == "spiking" else None)
 
-        torch.manual_seed(args.seed)
-        model = builder(name)()
-        trainable = model.num_effective_parameters if name == "spiking" else model.num_parameters
-        stored = model.num_parameters
-        hist, best = run_training(name, kind, model, lr, total_steps, streams, val_streams, args, device,
-                                  eval_every=args.eval_every, log_every=args.log_every,
-                                  eval_chunks=args.eval_chunks, seed=args.seed)
-        if best is None:
-            print(f"[{name}] produced no usable checkpoint (diverged?)", file=sys.stderr)
-            continue
-        model.load_state_dict(best)                               # best-validation weights
-        final = dict(val=evaluate(kind, model, val_streams, T), test=evaluate(kind, model, test_streams, T))
-        print(f"[{name}] TEST: bpc {final['test']['bpc']:.3f} | ppl {final['test']['ppl']:.2f} | "
-              f"next-char accuracy {final['test']['acc']:.1%}")
-        sample = sample_text(model, tok, args.prompt, args.sample_len, args.temperature, args.top_k, device)
-        history["models"][name] = dict(lr=lr, tuning=tuning, trainable_params=trainable, stored_params=stored,
-                                       steps_per_token=args.steps_per_token if name == "spiking" else None,
-                                       hist=hist, final=final, sample=sample)
-        json.dump(history, open(hist_path, "w"), indent=1)       # resume point
-        del model, best
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+        for sd in todo:
+            torch.manual_seed(sd)
+            model = builder(name, sd)()
+            trainable = model.num_effective_parameters if name == "spiking" else model.num_parameters
+            stored = model.num_parameters
+            hist, best = run_training(f"{name} seed {sd}", kind, model, lr, total_steps, streams, val_streams,
+                                      args, device, eval_every=args.eval_every, log_every=args.log_every,
+                                      eval_chunks=args.eval_chunks, seed=sd)
+            if best is None:
+                print(f"[{name}] seed {sd} produced no usable checkpoint (diverged?)", file=sys.stderr)
+                continue
+            model.load_state_dict(best)                           # best-validation weights
+            final = dict(val=evaluate(kind, model, val_streams, T), test=evaluate(kind, model, test_streams, T))
+            print(f"[{name}] seed {sd} TEST: bpc {final['test']['bpc']:.3f} | ppl {final['test']['ppl']:.2f} | "
+                  f"next-char accuracy {final['test']['acc']:.1%}")
+            if entry.get("sample") is None:
+                entry["sample"] = sample_text(model, tok, args.prompt, args.sample_len, args.temperature,
+                                              args.top_k, device)
+            entry["runs"].append(dict(seed=sd, hist=hist, final=final, trainable_params=trainable,
+                                      stored_params=stored))
+            entry["trainable_params"], entry["stored_params"] = entry["runs"][0]["trainable_params"], \
+                entry["runs"][0]["stored_params"]
+            history["models"][name] = entry
+            json.dump(history, open(hist_path, "w"), indent=1)    # resume point after every run
+            del model, best
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
     for name, e in history["models"].items():
-        print(f"\n--- {LABEL[name]} sample ---\n{e['sample']}")
+        print(f"\n--- {LABEL[name]} sample (first seed) ---\n{e.get('sample', '')}")
     make_outputs(history, args.out)
     return 0
 
