@@ -84,7 +84,9 @@ END_LABEL = {"spiking": "Spiking", "transformer_eff": "Transf. (trainable)",
 # Categorical slots 1-3 of the validated palette; colour follows the model in every figure.
 COLOR = {"spiking": "#2a78d6", "transformer_eff": "#eb6834", "transformer_stored": "#1baf7a"}
 MARKER = {"spiking": "o", "transformer_eff": "s", "transformer_stored": "^"}
-LR_CANDIDATES = {"spiking": [5e-4, 1e-3, 2e-3, 4e-3, 8e-3],
+# The spiking model's best rate in the first run was the largest candidate (8e-3) and its loss was still
+# falling there, so the list now continues upward to bracket the optimum.
+LR_CANDIDATES = {"spiking": [5e-4, 1e-3, 2e-3, 4e-3, 8e-3, 1.6e-2, 3.2e-2],
                  "transformer": [3e-4, 1e-3, 3e-3, 6e-3, 1e-2]}
 
 
