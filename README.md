@@ -171,8 +171,6 @@ STDP(net).update(rec)                                               # unsupervis
 
 ## Citations
 
-## Citations
-
 ### Neuron models
 
 - Bellec, G., Salaj, D., Subramoney, A., Legenstein, R., & Maass, W. (2018). Long short-term memory and learning-to-learn in networks of spiking neurons. *Advances in Neural Information Processing Systems 31 (NeurIPS 2018)*. https://arxiv.org/abs/1803.09574
