@@ -1,4 +1,4 @@
-# biolearning
+# RSNN Tests
 
 This project is intended as a quick experiment/demonstration of the training of Recurrent Spiking Neural Networks (RSNNs) as compared to Transformers.
 It evaluates the performance of RSNNs on a time-series noise-rejecting classification task before training an RSNN on a character-level NLP task in comparison to two Transformers.
