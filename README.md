@@ -42,9 +42,10 @@ An RSNN was compared to two Transformer models: one contained an equivalent numb
 
 ## Conclusions
 
+It is apparent from these tests that RSNNs have quite a ways to go before they can rival Transformers on language modeling tasks. Additionally, it's clear that our current models of biologically-inspired learning methods, such as STDP and R-STDP, perform highly subpar compared to BPTT. On a simple computation time basis, though, backprop appears to be the most inefficient learning method. Additionally, conventionally more complicated neuron models, like the Izhikevich model, are shown to perform worse on these learning tasks than simpler models, like LIF. Further work may focus on more accurately modeling biological neurons or improving biological learning methods to match the accuracy of backpropagation.
 ## Full Disclosure
 
-This project was made in collaboration with Claude Sonnet 5.5. The initial concept for this project, as well as each individual test was an original idea. The contribution of the AI in this case was the actual execution of writing the code. Each experiment was run manually over the course of 2-3 hours on a Surface Pro, but these experiments would all be massively accelerated with GPU access. Aside from simple formatting, visual design, the usage guide, the reference list, and a few factual corrections, this writeup was typed entirely by hand without AI assistance. All AI-generated content was reviewed.
+This project was made in collaboration with Claude Sonnet 5.5. The initial concept for this project, as well as each individual test was an original idea. The contribution of the AI in this case was the actual execution of writing the code. Each experiment was run manually over the course of 2-3 hours on a Surface Pro, but these experiments would all be massively accelerated with GPU access. Aside from simple formatting, visual design, the usage guide, and the reference list, this writeup was typed entirely by hand without AI assistance. All AI-generated content was reviewed.
 
 ## Usage
 
