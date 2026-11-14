@@ -143,32 +143,6 @@ STDP(net).update(rec)                                               # unsupervis
 
 `neuron` accepts `"if"`, `"lif"`, `"alif"`, `"stochastic_lif"` and `"izhikevich"`, and `inh_neuron=` gives the inhibitory cells their own model. For the language model, see `SpikingLM` in `model.py`.
 
-# Appendix
-
-## Neuron Models
-
-### IF
-
-### LIF
-
-### aLIF
-
-### sLIF
-
-### Izhikevich
-
-## Learning Methods
-
-### Reservoir
-
-### STDP
-
-### R-STDP
-
-### e-Prop
-
-### BPTT
-
 ## Citations
 
 ### Neuron models
